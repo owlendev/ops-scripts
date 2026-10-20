@@ -1,0 +1,5 @@
+# Secrets and per-client configs
+*.pem
+*.key
+clients/
+*.local.env
