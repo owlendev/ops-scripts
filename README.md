@@ -24,6 +24,7 @@ fresh EC2 ──► bootstrap.sh ──► updated · firewalled · SSH keys onl
 - [Audit](#audit)
 - [Destroying an instance](#destroying-an-instance)
 - [Important notes (read once)](#important-notes-read-once)
+- [Generating secrets and keys](#generating-secrets-and-keys)
 - [Adding a module](#adding-a-module)
 - [Troubleshooting](#troubleshooting)
 - [Roadmap](#roadmap)
@@ -284,6 +285,126 @@ Certificates need DNS pointing at the server first. Typical flow:
 Renewal is automatic (`certbot.timer`).
 
 In your site's `server {}` block, add `include snippets/security-headers.conf;`.
+
+---
+
+## Generating secrets and keys
+
+Use `openssl` for app secrets and passwords. It's installed on Ubuntu, Debian and macOS by default. **Generate a new value per client and per environment. Never reuse one.**
+
+### Quick reference
+
+| Need | Command | Output |
+|---|---|---|
+| App secret / JWT secret / API key | `openssl rand -hex 32` | 64 chars, `0-9a-f` |
+| Database password | `openssl rand -hex 24` | 48 chars, safe everywhere |
+| Shorter secret (base64) | `openssl rand -base64 32` | 44 chars, contains `+ / =` |
+| URL-safe secret | `openssl rand -base64 32 \| tr '+/' '-_' \| tr -d '='` | 43 chars, `A-Z a-z 0-9 - _` |
+| Human-typeable password | `openssl rand -base64 18 \| tr -d '+/='` | ~24 letters/digits |
+| SSH / EC2 key pair | `ssh-keygen -t ed25519 -f ~/.ssh/acme-ec2 -C acme-ec2` | see [EC2 key pairs](#ec2-key-pairs) |
+
+`32` is the number of random **bytes**. 32 bytes (256 bits) is plenty for any secret, and 24 bytes is plenty for a password.
+
+### Which format?
+
+- **Database passwords → hex.** Characters like `+ / = @ :` break connection strings such as `postgres://user:PASS@host/db` and some `.env` parsers. Hex has none of them.
+- **Secrets that go in URLs or headers → URL-safe base64 or hex.**
+- **Anything else → either.** Hex is the safe default if you're not sure.
+
+### Framework-specific
+
+Some frameworks have their own generator in a specific format. Use theirs:
+
+```bash
+php artisan key:generate                       # Laravel APP_KEY
+python3 -c "import secrets; print(secrets.token_urlsafe(50))"   # Django SECRET_KEY, Flask
+bin/rails secret                               # Rails SECRET_KEY_BASE
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"  # Node
+```
+
+### Write straight into a `.env` file
+
+This keeps the value off your screen. Commands typed in full go into shell history, but these generate the value inside the command, so only the command is saved, not the secret:
+
+```bash
+echo "APP_SECRET=$(openssl rand -hex 32)"  >> .env
+echo "DB_PASSWORD=$(openssl rand -hex 24)" >> .env
+chmod 600 .env
+```
+
+### EC2 key pairs
+
+You have two options. **Option B is better**, because the private key is created on your machine and never passes through AWS.
+
+**Option A: create it in the AWS console**
+
+EC2 → Key Pairs → Create key pair → type **ED25519**, format **.pem** → it downloads once. AWS does not keep a copy, so if you lose the file you can't download it again.
+
+```bash
+mv ~/Downloads/acme-ec2.pem ~/.ssh/
+chmod 400 ~/.ssh/acme-ec2.pem        # ssh refuses keys that other users can read
+```
+
+**Option B: generate locally and import the public key (recommended)**
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/acme-ec2 -C "acme-ec2"
+# creates ~/.ssh/acme-ec2 (private, keep it) and ~/.ssh/acme-ec2.pub (public, safe to share)
+```
+
+Then import the `.pub` file:
+
+- **Console:** EC2 → Key Pairs → Actions → **Import key pair** → paste the contents of `~/.ssh/acme-ec2.pub`
+- **or CLI:** `aws ec2 import-key-pair --key-name acme-ec2 --public-key-material fileb://~/.ssh/acme-ec2.pub`
+
+When you launch an instance, choose that key pair. Connect with:
+
+```bash
+ssh -i ~/.ssh/acme-ec2 ubuntu@<ip>
+```
+
+**Tips**
+
+- **One key per client.** If one key leaks, only that client is exposed, and you can drop a client cleanly when the work ends.
+- **Use a passphrase** when `ssh-keygen` asks. Add the key once with `ssh-add ~/.ssh/acme-ec2` so you don't have to type the passphrase on every connection.
+- Key pairs are **per region**. Import the same `.pub` file into each region you use.
+- **Save typing** with `~/.ssh/config`:
+
+  ```
+  Host acme-web
+      HostName 203.0.113.10
+      User ubuntu
+      IdentityFile ~/.ssh/acme-ec2
+      # Port 2222    # if you changed SSH_PORT
+  ```
+
+  Then just `ssh acme-web`.
+
+- **Add another person's (or another of your) keys to a running server.** The EC2 key pair is only installed at launch, so append the extra key yourself:
+
+  ```bash
+  echo "ssh-ed25519 AAAA... colleague@laptop" >> ~/.ssh/authorized_keys
+  ```
+
+  Remove that line to revoke their access.
+- **Lost the key?** In the AWS console, select the instance → **Connect** → **EC2 Instance Connect**. It pushes a temporary key, so it works even with password login disabled, but the security group must allow SSH from AWS's Instance Connect IP range. Once you're in, add a new public key to `~/.ssh/authorized_keys`.
+- **Back up private keys** in your password manager (1Password and Bitwarden both store SSH keys).
+
+### nginx basic auth (password-protect a staging site)
+
+```bash
+sudo apt install apache2-utils
+sudo htpasswd -c /etc/nginx/.htpasswd clientname   # prompts for the password
+```
+
+### Where to keep them
+
+- **Never in git.** Not in this repo and not in the app repo. Commit a `.env.example` with empty values instead.
+- **On the server:** in the app's `.env` with `chmod 600`, owned by the user that runs the app.
+- **Your copy:** a password manager (1Password, Bitwarden), with one vault or folder per client.
+- **Later, on AWS:** SSM Parameter Store (SecureString, free tier) or Secrets Manager. The app reads them using the instance's IAM role, so no secret files live on the server.
+
+If a secret leaks (committed to git, pasted in chat, sent by email), **rotate it**. Deleting the commit isn't enough.
 
 ---
 
