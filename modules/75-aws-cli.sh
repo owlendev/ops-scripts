@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# AWS CLI v2 (official installer). On EC2, prefer an IAM instance role over
-# putting access keys on the server.
+# AWS CLI v2 (official installer).
+# On EC2, prefer an IAM instance role over putting access keys on the server.
 set -euo pipefail
 # shellcheck source=../lib/common.sh
 . "$(dirname "$0")/../lib/common.sh"

@@ -5,21 +5,32 @@ Prepare fresh Ubuntu/Debian servers (mainly AWS EC2) for client work: updated, h
 This repo is only for **preparing** a server. Deploying the client's application is a separate step/repo.
 
 ```
-fresh EC2 ──► bootstrap.sh ──► updated · firewalled · SSH keys only · fail2ban · auto security updates
-                                  (+ optional: nginx/HTTPS, Docker, AWS CLI)
+fresh EC2 ──► setup.sh (menu)  ─┐
+          └─► bootstrap.sh -c   ─┴─► updated · firewalled · SSH keys only · fail2ban · auto security updates
+                                     (+ optional: modern CLI tools, Neovim/LazyVim, lazygit, herdr,
+                                        nginx/HTTPS, Docker, AWS CLI)
 ```
+
+There are two ways to drive it, and they use the same modules:
+
+- **`sudo ./setup.sh`**: an interactive menu with checklists. Use it when you're on the server doing things by hand.
+- **`sudo ./bootstrap.sh [-c config.env]`**: no questions asked. Use it for repeatable setups, scripts and (later) Terraform.
+
+The menu can save your choices as a config file, so you can reuse them with `bootstrap.sh` next time.
 
 ---
 
 ## Contents
 
 - [Layout](#layout)
+- [Interactive menu](#interactive-menu)
 - [Quick start](#quick-start)
   - [A. Launch + prepare a new EC2 instance in one command](#a-launch--prepare-a-new-ec2-instance-in-one-command)
   - [B. Prepare an existing server from your machine](#b-prepare-an-existing-server-from-your-machine)
   - [C. Run directly on the server](#c-run-directly-on-the-server)
 - [Client configs](#client-configs)
 - [Modules](#modules)
+- [Tools installed](#tools-installed)
 - [Configuration reference](#configuration-reference)
 - [Audit](#audit)
 - [Destroying an instance](#destroying-an-instance)
@@ -35,7 +46,8 @@ fresh EC2 ──► bootstrap.sh ──► updated · firewalled · SSH keys onl
 
 ```
 ops-scripts/
-├── bootstrap.sh            # Entry point: runs the enabled modules in order (run ON the server)
+├── setup.sh                # Interactive menu: checklists → run (run ON the server)
+├── bootstrap.sh            # Non-interactive: runs the enabled modules in order (run ON the server)
 ├── config/
 │   └── default.env         # All settings and their defaults
 ├── lib/
@@ -43,12 +55,14 @@ ops-scripts/
 ├── modules/                # One job per script, run in numeric order, safe to re-run
 │   ├── 10-system-update.sh
 │   ├── 20-base-tools.sh
+│   ├── 22-cli-tools.sh     # ripgrep, fd, fzf, bat, eza, btop...
 │   ├── 25-swap.sh
 │   ├── 30-firewall.sh
 │   ├── 40-ssh-hardening.sh
 │   ├── 45-fail2ban.sh
 │   ├── 50-auto-updates.sh
 │   ├── 55-kernel-hardening.sh
+│   ├── 60-dev-tools.sh     # optional: git setup, lazygit, Neovim, LazyVim, herdr
 │   ├── 70-docker.sh        # optional
 │   ├── 75-aws-cli.sh       # optional
 │   └── 80-nginx.sh         # optional (+ certbot / HTTPS)
@@ -65,6 +79,50 @@ ops-scripts/
 ```
 
 **Supported:** Ubuntu 22.04 / 24.04 LTS (main target) and Debian 12. Tested on Ubuntu 24.04.
+
+---
+
+## Interactive menu
+
+The easiest way to prepare a server by hand: create the instance in the AWS console, SSH in, and run:
+
+```bash
+git clone <this-repo> ops-scripts && cd ops-scripts
+sudo ./setup.sh
+```
+
+```
+┌──────────── ops-scripts - web1 ─────────────┐
+│ What do you want to do?                     │
+│                                             │
+│   setup   Guided setup: choose modules,     │
+│           tools, settings > run             │
+│   module  Run a single module               │
+│   audit   Security audit (read-only)        │
+│   secret  Generate a secret or password     │
+│   status  Show current choices              │
+│   exit    Exit                              │
+└─────────────────────────────────────────────┘
+```
+
+**Guided setup** goes through these screens:
+
+1. **Modules checklist.** Tick what you want. The defaults are pre-ticked.
+2. **CLI tools checklist** (if `cli-tools` is ticked): pick individual tools.
+3. **Dev tools checklist** (if `dev-tools` is ticked): git, lazygit, Neovim, LazyVim, herdr.
+4. **Settings.** Only the settings for the modules you picked are shown (timezone, hostname, SSH port, HTTPS domains, git name/email…). Values are checked before they're accepted.
+5. **Review.** A summary with warnings, for example if the SSH port changes or your user has no SSH key. Then **Run now** or **Back**.
+6. **Save?** You can save the choices as a config file (default `config/saved.local.env`, git-ignored).
+
+**Keys:** arrows move · **Space** ticks a box · **Enter** confirms · **Tab** jumps to the buttons · **Esc** goes back.
+
+Other ways to open it:
+
+```bash
+sudo ./setup.sh -c clients/acme.env      # start with this config's choices pre-ticked
+sudo ./bootstrap.sh -i                   # same menu
+tools/push-and-run.sh -i key.pem ubuntu@host -- --interactive   # copy repo + open the menu remotely
+```
 
 ---
 
@@ -176,15 +234,62 @@ They run in numeric order. All of them are **idempotent**, so re-running only ch
 |---|---|---|
 | `system-update` | on | `apt update` + `dist-upgrade`, autoremove, timezone, NTP, optional hostname |
 | `base-tools` | on | curl, wget, git, vim, htop, tmux, jq, unzip, rsync, dnsutils (`dig`), net-tools, traceroute, mtr, tcpdump, netcat, nmap, whois… |
+| `cli-tools` | on | Modern CLI tools (see [Tools installed](#tools-installed)), `fd`/`bat` names, and shell helpers (`ll`, `z`, fzf Ctrl-R) |
 | `swap` | on | 2G swap file when RAM < 4G (stops t3.micro/small builds being OOM-killed) |
 | `firewall` | on | UFW: deny inbound, allow SSH (rate limited), 80, 443 and any extra ports |
 | `ssh-hardening` | on | Key-only login, no root login, MaxAuthTries 3, idle timeout, no X11/agent forwarding, optional port/AllowUsers. **Refuses to run if the admin user has no SSH key** |
 | `fail2ban` | on | Bans IPs after 5 failed SSH logins in 10 min, for 1 hour |
 | `auto-updates` | on | unattended-upgrades for daily security updates (auto reboot off by default) |
 | `kernel-hardening` | on | sysctl: SYN cookies, no ICMP redirects/source routing, log martians, restrict dmesg/kernel pointers |
+| `dev-tools` | off | git setup, lazygit, latest Neovim, LazyVim, herdr, all for `ADMIN_USER` (see [Tools installed](#tools-installed)) |
 | `docker` | off | Docker Engine + compose/buildx plugins from Docker's repo, log rotation, admin user in `docker` group |
 | `aws-cli` | off | AWS CLI v2 |
 | `nginx` | off | nginx with version hidden, `snippets/security-headers.conf`, certbot. Requests a certificate if `CERTBOT_DOMAINS` is set |
+
+---
+
+## Tools installed
+
+### `cli-tools` (apt, on by default)
+
+The list is in `CLI_TOOLS`, or tick them in the menu. A tool your OS version doesn't package is skipped with a warning instead of failing. Ubuntu 22.04 lacks `eza`, `tealdeer` and `git-delta`, and Debian 12 lacks `eza` and `git-delta`.
+
+| Tool | Command | What for |
+|---|---|---|
+| ripgrep | `rg` | Very fast grep: `rg "error" /var/log` |
+| fd-find | `fd` | Simple fast find: `fd nginx /etc` |
+| fzf | `fzf` | Fuzzy finder: **Ctrl-R** history, **Ctrl-T** files, **Alt-C** cd |
+| bat | `bat` | `cat` with syntax highlighting |
+| eza | `ll`, `lt` | Modern `ls` with git status, plus a tree view |
+| zoxide | `z` | `z nginx` jumps to `/etc/nginx` once you've visited it |
+| btop | `btop` | CPU / memory / disk / network monitor |
+| ncdu | `ncdu /` | What's filling the disk |
+| duf | `duf` | Disk usage overview |
+| tealdeer | `tldr tar` | Short practical examples (run `tldr --update` once) |
+| git-delta | (automatic) | Readable `git diff`. Set as git's pager by `dev-tools` |
+| httpie | `http` | Friendly curl for APIs: `http GET api.example.com/health` |
+| iftop / nethogs | `iftop`, `nethogs` | Bandwidth per connection / per process |
+| iotop-c | `iotop-c` | Disk I/O per process |
+| sysstat | `sar`, `iostat` | Performance history |
+| strace | `strace` | Trace what a process is doing |
+| lnav | `lnav /var/log/nginx/` | Log viewer with search and filters |
+| plocate | `locate` | Instant file-name search |
+
+The shell helpers (`CLI_SHELL_INTEGRATION=yes`) live in `/etc/ops-shell.sh` and are loaded from the end of `~/.bashrc` (for `ADMIN_USER`, root and new users). They take effect in **new** shells.
+
+### `dev-tools` (off by default)
+
+Pick items in `DEV_TOOLS`, or tick them in the menu. Binaries come from the projects' **official GitHub releases**, and each download is checked against the SHA-256 checksum published with the release. Re-running only updates a tool when there's a newer release.
+
+| Item | What you get |
+|---|---|
+| `git` | git + git-lfs. For `ADMIN_USER`: `init.defaultBranch main`, `push.autoSetupRemote`, `fetch.prune`, delta as pager, and your `GIT_USER_NAME` / `GIT_USER_EMAIL` |
+| `lazygit` | [lazygit](https://github.com/jesseduffield/lazygit), a terminal UI for git, in `/usr/local/bin` |
+| `neovim` | Latest [Neovim](https://github.com/neovim/neovim) in `/opt/nvim` (apt's version is too old for LazyVim) |
+| `lazyvim` | [LazyVim](https://www.lazyvim.org) starter config in `~/.config/nvim` for `ADMIN_USER`, plugins pre-installed. Also adds Neovim, tree-sitter CLI, a C compiler, ripgrep, fd and fzf. **An existing `~/.config/nvim` is never overwritten.** Use a [Nerd Font](https://www.nerdfonts.com) in *your* terminal app to see icons |
+| `herdr` | [herdr](https://github.com/herdrdev/herdr), a terminal multiplexer for coding agents. Sessions keep running after you disconnect, and you reattach over SSH. Start it with `herdr` |
+
+If the GitHub API rate-limits you (60 requests per hour per IP), set `GITHUB_TOKEN`: `sudo GITHUB_TOKEN=ghp_… ./bootstrap.sh --only dev-tools`.
 
 ---
 
@@ -199,6 +304,10 @@ All variables are in `config/default.env`. The main ones:
 | `TIMEZONE` | `UTC` | e.g. `Asia/Riyadh` |
 | `HOSTNAME_FQDN` | empty | e.g. `web1.acme.com` |
 | `EXTRA_PACKAGES` | empty | Space-separated extra apt packages |
+| `CLI_TOOLS` | 19 tools | apt package names for `cli-tools` |
+| `CLI_SHELL_INTEGRATION` | `yes` | `ll`/`lt` aliases, `z`, fzf key bindings |
+| `DEV_TOOLS` | `git lazygit neovim lazyvim herdr` | Items for `dev-tools` |
+| `GIT_USER_NAME` / `GIT_USER_EMAIL` | empty | git identity for `ADMIN_USER` |
 | `SWAP_SIZE` | `auto` | `auto`, `0`, `1G`, `4G`… |
 | `FIREWALL_ALLOW_HTTP` / `_HTTPS` | `yes` | |
 | `FIREWALL_EXTRA_PORTS` | empty | e.g. `"8080/tcp 51820/udp"` |
@@ -415,7 +524,8 @@ If a secret leaks (committed to git, pasted in chat, sent by email), **rotate it
 
    ```bash
    #!/usr/bin/env bash
-   # One line saying what this does.
+   # Short summary, max ~60 chars (shown in the setup.sh checklist).
+   # More detail on the following lines if needed.
    set -euo pipefail
    # shellcheck source=../lib/common.sh
    . "$(dirname "$0")/../lib/common.sh"

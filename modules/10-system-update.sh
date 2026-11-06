@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Update all packages, set timezone and (optionally) hostname.
+# Update all packages, set timezone and hostname.
 set -euo pipefail
 # shellcheck source=../lib/common.sh
 . "$(dirname "$0")/../lib/common.sh"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Host firewall with UFW: deny all inbound except SSH (+ HTTP/HTTPS by default).
+# UFW firewall: deny inbound except SSH, HTTP and HTTPS.
 # On EC2 the security group is the first firewall; this is the second layer.
 set -euo pipefail
 # shellcheck source=../lib/common.sh

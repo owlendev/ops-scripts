@@ -81,6 +81,50 @@ pkg_installed() {
   dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
 }
 
+# True if apt can install the package on this OS version.
+apt_available() {
+  apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ { print $2 }' | grep -qv '^(none)$'
+}
+
+# Install whichever of the given packages are missing.
+ensure_packages() {
+  local p missing=()
+  for p in "$@"; do pkg_installed "$p" || missing+=("$p"); done
+  [[ ${#missing[@]} -eq 0 ]] && return 0
+  apt_get update
+  apt_install "${missing[@]}"
+}
+
+# Debian/Ubuntu rename some binaries to avoid clashes; add the usual names.
+link_distro_names() {
+  [[ -x /usr/bin/fdfind && ! -e /usr/local/bin/fd ]]  && ln -s /usr/bin/fdfind /usr/local/bin/fd
+  [[ -x /usr/bin/batcat && ! -e /usr/local/bin/bat ]] && ln -s /usr/bin/batcat /usr/local/bin/bat
+  return 0
+}
+
+# Latest release of a GitHub repo (owner/name) as JSON.
+# Set GITHUB_TOKEN if you hit the API rate limit (60 requests/hour per IP).
+gh_latest_release() {
+  local auth=()
+  [[ -n "${GITHUB_TOKEN:-}" ]] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+  curl -fsSL ${auth[@]+"${auth[@]}"} "https://api.github.com/repos/$1/releases/latest" \
+    || die "Could not reach the GitHub API for $1 (rate limited? set GITHUB_TOKEN)"
+}
+
+# Download one asset of a release and verify its SHA-256 checksum.
+gh_download_asset() { # release_json asset_name dest
+  local url digest
+  url=$(jq -r --arg n "$2" '.assets[] | select(.name == $n) | .browser_download_url' <<< "$1")
+  [[ -n "$url" ]] || die "Release asset '$2' not found"
+  digest=$(jq -r --arg n "$2" '.assets[] | select(.name == $n) | .digest // empty' <<< "$1")
+  curl -fsSL "$url" -o "$3"
+  if [[ "$digest" == sha256:* ]]; then
+    echo "${digest#sha256:}  $3" | sha256sum -c --quiet - || die "Checksum mismatch for $2"
+  else
+    warn "No checksum published for $2; not verified"
+  fi
+}
+
 user_exists() { id "$1" >/dev/null 2>&1; }
 
 user_home() { getent passwd "$1" | cut -d: -f6; }

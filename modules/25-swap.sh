@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Add a swap file so small instances (t3.micro/small) don't get OOM-killed
-# during builds or package installs.
+# Swap file so small instances don't run out of memory.
+# (t3.micro/small otherwise get OOM-killed during builds and package installs.)
 set -euo pipefail
 # shellcheck source=../lib/common.sh
 . "$(dirname "$0")/../lib/common.sh"

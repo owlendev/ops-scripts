@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Network/kernel sysctl hardening. Leaves ip_forward alone (Docker needs it).
+# Kernel/network sysctl hardening (SYN cookies, no redirects).
+# Leaves ip_forward alone (Docker needs it).
 set -euo pipefail
 # shellcheck source=../lib/common.sh
 . "$(dirname "$0")/../lib/common.sh"

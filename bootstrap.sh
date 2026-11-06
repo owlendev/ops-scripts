@@ -17,6 +17,7 @@ Options:
   -o, --only LIST      Run only these modules, comma separated (ignores ENABLE_* flags)
   -s, --skip LIST      Skip these modules, comma separated
   -l, --list           List modules and whether they are enabled, then exit
+  -i, --interactive    Open the interactive menu (same as ./setup.sh)
   -h, --help           Show this help
 
 Examples:
@@ -29,6 +30,7 @@ EOF
 ONLY=""
 SKIP=""
 LIST=0
+INTERACTIVE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -c|--config) [[ -n "${2:-}" ]] || die "--config needs a file"
@@ -37,10 +39,15 @@ while [[ $# -gt 0 ]]; do
     -o|--only)   ONLY="${2:-}"; shift 2 ;;
     -s|--skip)   SKIP="${2:-}"; shift 2 ;;
     -l|--list)   LIST=1; shift ;;
+    -i|--interactive) INTERACTIVE=1; shift ;;
     -h|--help)   usage; exit 0 ;;
     *)           usage >&2; die "Unknown option: $1" ;;
   esac
 done
+
+if (( INTERACTIVE )); then
+  exec "$OPS_ROOT/setup.sh" ${OPS_CONFIG:+-c "$OPS_CONFIG"}
+fi
 
 load_config
 

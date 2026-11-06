@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# nginx web server + certbot. Requests a Let's Encrypt certificate when
-# CERTBOT_DOMAINS and CERTBOT_EMAIL are set (DNS must already point here).
+# nginx web server + certbot for Let's Encrypt HTTPS.
+# Requests a certificate when CERTBOT_DOMAINS and CERTBOT_EMAIL are set (DNS must already point here).
 set -euo pipefail
 # shellcheck source=../lib/common.sh
 . "$(dirname "$0")/../lib/common.sh"
