@@ -103,6 +103,17 @@ if command -v nginx >/dev/null; then
   nginx -T 2>/dev/null | grep -qE '^\s*server_tokens\s+off' && pass "nginx hides its version" || check_warn "nginx server_tokens not off"
 fi
 
+# --- Tailscale --------------------------------------------------------------
+if command -v tailscale >/dev/null; then
+  echo; echo "Tailscale"
+  if tailscale_online; then
+    ts_name=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' 2>/dev/null | sed 's/\.$//')
+    pass "Connected: $(tailscale ip -4 2>/dev/null) ${ts_name}"
+  else
+    check_warn "Installed but not connected (sudo tailscale up)"
+  fi
+fi
+
 # --- EC2 --------------------------------------------------------------------
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://169.254.169.254/latest/meta-data/ 2>/dev/null || true)
 if [[ "$code" == "401" ]]; then

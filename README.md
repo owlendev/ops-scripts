@@ -31,6 +31,7 @@ The menu can save your choices as a config file, so you can reuse them with `boo
 - [Client configs](#client-configs)
 - [Modules](#modules)
 - [Tools installed](#tools-installed)
+- [Tailscale](#tailscale)
 - [Configuration reference](#configuration-reference)
 - [Audit](#audit)
 - [Destroying an instance](#destroying-an-instance)
@@ -63,6 +64,7 @@ ops-scripts/
 │   ├── 50-auto-updates.sh
 │   ├── 55-kernel-hardening.sh
 │   ├── 60-dev-tools.sh     # optional: git setup, lazygit, Neovim, LazyVim, herdr
+│   ├── 65-tailscale.sh     # optional: private VPN access, Tailscale SSH
 │   ├── 70-docker.sh        # optional
 │   ├── 75-aws-cli.sh       # optional
 │   └── 80-nginx.sh         # optional (+ certbot / HTTPS)
@@ -242,6 +244,7 @@ They run in numeric order. All of them are **idempotent**, so re-running only ch
 | `auto-updates` | on | unattended-upgrades for daily security updates (auto reboot off by default) |
 | `kernel-hardening` | on | sysctl: SYN cookies, no ICMP redirects/source routing, log martians, restrict dmesg/kernel pointers |
 | `dev-tools` | off | git setup, lazygit, latest Neovim, LazyVim, herdr, all for `ADMIN_USER` (see [Tools installed](#tools-installed)) |
+| `tailscale` | off | Tailscale from its official repo, UFW rules for the tailnet, optional auto-login, Tailscale SSH, and closing public SSH (see [Tailscale](#tailscale)) |
 | `docker` | off | Docker Engine + compose/buildx plugins from Docker's repo, log rotation, admin user in `docker` group |
 | `aws-cli` | off | AWS CLI v2 |
 | `nginx` | off | nginx with version hidden, `snippets/security-headers.conf`, certbot. Requests a certificate if `CERTBOT_DOMAINS` is set |
@@ -293,6 +296,90 @@ If the GitHub API rate-limits you (60 requests per hour per IP), set `GITHUB_TOK
 
 ---
 
+## Tailscale
+
+[Tailscale](https://tailscale.com) puts your laptop, phone and servers on a private network (a "tailnet"). Every device gets a stable private IP (`100.x.y.z`) and a name like `acme-web`. That lets you:
+
+- SSH into servers **without exposing port 22 to the internet**
+- reach private things (databases, admin panels, Grafana) without opening ports
+- keep working when your own IP changes, with no security group edits
+
+The free Personal plan is enough to start.
+
+### 1. One-time: your own devices
+
+1. Sign up at [login.tailscale.com](https://login.tailscale.com).
+2. Install Tailscale on your laptop (and phone) and log in: [tailscale.com/download](https://tailscale.com/download).
+
+### 2. Add a server
+
+**Option A: log in by hand.** No key needed, which suits a one-off server.
+
+Tick `tailscale` in the menu (or set `ENABLE_TAILSCALE=yes`) and run the setup. Then on the server:
+
+```bash
+sudo tailscale up --ssh --hostname=acme-web
+# It prints a login URL. Open it on your laptop and approve the server.
+```
+
+**Option B: join automatically with an auth key.** No browser step.
+
+1. In the admin console: **Settings → Keys → Generate auth key**. For servers, tick **Pre-approved**, and tick **Reusable** if you'll use it for several servers. Optionally add a tag.
+2. Pass the key **at run time** so it never lands in a file:
+
+   ```bash
+   sudo TAILSCALE_AUTHKEY=tskey-auth-xxxx ./bootstrap.sh -c clients/acme.env
+   ```
+
+   Or paste it into the menu: **Settings → TAILSCALE_AUTHKEY**. It's hidden while you type and is never written to saved config files.
+
+**After adding a server**, in the admin console open **Machines → … → Disable key expiry** for it. Otherwise it drops off the tailnet after 180 days and needs a new login.
+
+### 3. Use it
+
+From your laptop (Tailscale running):
+
+```bash
+ssh ubuntu@acme-web            # by name (MagicDNS), or
+ssh ubuntu@100.101.102.103     # by Tailscale IP
+```
+
+On the server:
+
+```bash
+tailscale status     # devices in your tailnet and whether they're online
+tailscale ip -4      # this server's Tailscale IP
+tailscale ping laptop
+tailscale netcheck   # connectivity details (direct vs relayed)
+```
+
+The audit also reports whether Tailscale is connected.
+
+### Tailscale SSH (optional)
+
+With `TAILSCALE_SSH=yes` (or `tailscale up --ssh`), Tailscale handles SSH that arrives over the tailnet. It checks **your Tailscale identity** instead of an SSH key, and the tailnet's access policy decides who may log in as which user. Normal sshd with keys keeps working alongside it.
+
+Your tailnet's default policy may ask you to re-authenticate in the browser now and then ("check mode"). You can change that in the admin console under **Access controls**.
+
+### Close public SSH (optional, recommended once it works)
+
+When you can reliably SSH over Tailscale, you can stop exposing SSH to the internet entirely:
+
+1. **Test first:** `ssh ubuntu@acme-web` from your laptop over Tailscale.
+2. Set `TAILSCALE_SSH_ONLY=yes` and run `sudo ./bootstrap.sh -c clients/acme.env --only firewall`. This removes the public SSH rules from UFW. Your current session stays connected.
+3. In the **EC2 security group**, delete the SSH (22) inbound rule. Port 22 is now closed to the internet; HTTP/HTTPS stay public.
+
+Safety: the firewall only closes public SSH **while Tailscale is connected**. If Tailscale is logged out or stopped when the firewall module runs, public SSH stays open and you get a warning. If you ever get locked out anyway, use the AWS console: **EC2 Instance Connect** (only if the security group still allows it) or the **EC2 Serial Console**.
+
+### Notes
+
+- **No security group change needed** to *use* Tailscale. It connects outbound. Optionally allow inbound **UDP 41641** in the security group so devices connect directly instead of through a relay, which is faster. UFW already allows it.
+- **Private services:** bind a database or admin panel to the Tailscale IP or `127.0.0.1`, never `0.0.0.0`. Then it's reachable only over the tailnet, e.g. `psql -h acme-web`.
+- **Per-client separation:** one tailnet with tags (`tag:acme`) and access rules is usually enough. A separate tailnet per client is cleaner if the client will own it later.
+- **Remove a server:** `sudo tailscale logout`, then delete it under **Machines** in the admin console.
+
+---
+
 ## Configuration reference
 
 All variables are in `config/default.env`. The main ones:
@@ -308,6 +395,11 @@ All variables are in `config/default.env`. The main ones:
 | `CLI_SHELL_INTEGRATION` | `yes` | `ll`/`lt` aliases, `z`, fzf key bindings |
 | `DEV_TOOLS` | `git lazygit neovim lazyvim herdr` | Items for `dev-tools` |
 | `GIT_USER_NAME` / `GIT_USER_EMAIL` | empty | git identity for `ADMIN_USER` |
+| `TAILSCALE_AUTHKEY` | empty | `tskey-auth-…` to join automatically. **Secret**: pass it at run time, don't commit it |
+| `TAILSCALE_HOSTNAME` | empty | Name in your tailnet (default: system hostname) |
+| `TAILSCALE_SSH` | `no` | Enable Tailscale SSH |
+| `TAILSCALE_TAGS` | empty | e.g. `tag:server` (must exist in your tailnet policy) |
+| `TAILSCALE_SSH_ONLY` | `no` | Close public SSH once Tailscale is connected |
 | `SWAP_SIZE` | `auto` | `auto`, `0`, `1G`, `4G`… |
 | `FIREWALL_ALLOW_HTTP` / `_HTTPS` | `yes` | |
 | `FIREWALL_EXTRA_PORTS` | empty | e.g. `"8080/tcp 51820/udp"` |

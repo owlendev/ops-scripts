@@ -125,6 +125,11 @@ gh_download_asset() { # release_json asset_name dest
   fi
 }
 
+tailscale_online() {
+  command -v tailscale >/dev/null &&
+    tailscale status --json 2>/dev/null | grep -Eq '"BackendState": *"Running"'
+}
+
 user_exists() { id "$1" >/dev/null 2>&1; }
 
 user_home() { getent passwd "$1" | cut -d: -f6; }
