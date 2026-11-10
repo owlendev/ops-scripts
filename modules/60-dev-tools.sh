@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Dev tools: git, lazygit, lazydocker, Neovim, LazyVim, herdr.
 # Installed from official releases (checksums verified); configs go to ADMIN_USER.
+# Each tool is verified after install and recorded for checks/audit.sh. Exit code
+# 3 means it finished but some tools failed (the summary says why and how to fix).
 set -euo pipefail
 # shellcheck source=../lib/common.sh
 . "$(dirname "$0")/../lib/common.sh"
@@ -139,10 +141,40 @@ install_herdr() {
   ok "herdr $tag installed (run 'herdr' to start)"
 }
 
-want git     && install_git
-want lazygit && install_lazygit
-want lazydocker && install_lazydocker
-want neovim  && install_neovim
-want lazyvim && install_lazyvim
-want herdr   && install_herdr
-exit 0
+# Install each tool on its own, so one failure doesn't stop the rest. Then check
+# that it really runs for ADMIN_USER, and record the result for checks/audit.sh.
+results=()
+failed=0
+for t in git lazygit lazydocker neovim lazyvim herdr; do
+  want "$t" || continue
+  info "--- $t"
+  log="$tmp/$t.log"
+  set +e
+  ( set -e; "install_$t" ) 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  set -e
+  if (( rc == 0 )) && ver="$(dev_tool_works "$t" "$ADMIN_USER")"; then
+    results+=("ok|$t|$ver|")
+    tool_record "$t" dev ok "$ADMIN_USER" "$ver" ""
+  else
+    (( rc == 0 )) && echo "${ver:-}" >> "$log"
+    explain_failure "$log" "$t"
+    results+=("failed|$t|$REASON|$HINT")
+    tool_record "$t" dev failed "$ADMIN_USER" "$REASON" "$HINT"
+    failed=$((failed + 1))
+  fi
+done
+
+echo
+info "Dev tools: each one checked by running it as $ADMIN_USER"
+for r in "${results[@]}"; do
+  IFS='|' read -r st t detail hint <<< "$r"
+  if [[ "$st" == ok ]]; then
+    ok "$(printf '%-11s %s' "$t" "$detail")"
+  else
+    err "$(printf '%-11s %s' "$t" "$detail")"
+    echo "                   why: $hint"
+    echo "                   fix: sudo $OPS_ROOT/checks/fix.sh tool $t"
+  fi
+done
+(( failed == 0 )) || exit 3 # finished, with problems (bootstrap carries on)

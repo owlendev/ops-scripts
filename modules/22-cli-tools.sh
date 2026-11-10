@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Modern CLI tools: ripgrep, fd, fzf, bat, eza, btop, ncdu...
-# Tools the OS doesn't package are skipped with a warning.
+# Tools the OS doesn't package are skipped with a warning. Each result is recorded
+# for checks/audit.sh; exit code 3 means some failed (the reason is printed).
 set -euo pipefail
 # shellcheck source=../lib/common.sh
 . "$(dirname "$0")/../lib/common.sh"
@@ -14,27 +15,53 @@ for p in "${wanted[@]}"; do
   pkg_installed "$p" || missing+=("$p")
 done
 
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+unavailable=()
 if [[ ${#missing[@]} -eq 0 ]]; then
   ok "All ${#wanted[@]} CLI tools already installed"
 else
-  apt_get update
-  install=(); unavailable=()
+  apt_get update 2>&1 | tee "$tmp/update.log" || warn "apt update failed; trying the install anyway"
+  install=()
   for p in "${missing[@]}"; do
     if apt_available "$p"; then install+=("$p"); else unavailable+=("$p"); fi
   done
   if [[ ${#install[@]} -gt 0 ]]; then
     info "Installing: ${install[*]}"
-    apt_install "${install[@]}"
-    ok "Installed ${#install[@]} tool(s)"
-  fi
-  if [[ ${#unavailable[@]} -gt 0 ]]; then
-    warn "Not packaged for $OS_ID $OS_VERSION, skipped: ${unavailable[*]}"
+    if ! apt_install "${install[@]}" 2>&1 | tee "$tmp/all.log"; then
+      # One bad package fails the whole batch: retry one by one to find which.
+      warn "Install failed; retrying one at a time to find the problem"
+      for p in "${install[@]}"; do
+        pkg_installed "$p" || apt_install "$p" > "$tmp/$p.log" 2>&1 || true
+      done
+    fi
   fi
 fi
 
+# Record each tool's result for checks/audit.sh; report failures with a reason.
+failed=0
+for p in "${wanted[@]}"; do
+  if pkg_installed "$p"; then
+    tool_record "$p" cli ok root "$(dpkg-query -W -f='${Version}' "$p")" ""
+  elif [[ " ${unavailable[*]-} " == *" $p "* ]]; then
+    tool_record "$p" cli skipped root "Not packaged for $OS_ID $OS_VERSION" "Remove $p from CLI_TOOLS"
+    warn "$(printf '%-11s not packaged for %s %s, skipped' "$p" "$OS_ID" "$OS_VERSION")"
+  else
+    log="$tmp/$p.log"; [[ -f "$log" ]] || log="$tmp/all.log"
+    cat "$tmp/update.log" >> "$log" 2>/dev/null || true
+    explain_failure "$log" "$p"
+    tool_record "$p" cli failed root "$REASON" "$HINT"
+    err "$(printf '%-11s %s' "$p" "$REASON")"
+    echo "                   why: $HINT"
+    echo "                   fix: sudo $OPS_ROOT/checks/fix.sh tool $p"
+    failed=$((failed + 1))
+  fi
+done
+(( failed == 0 )) && ok "CLI tools: all ${#wanted[@]} checked ($(( ${#wanted[@]} - ${#unavailable[@]} )) installed)"
+
 link_distro_names
 
-is_true "$CLI_SHELL_INTEGRATION" || exit 0
+is_true "$CLI_SHELL_INTEGRATION" || exit $(( failed ? 3 : 0 ))
 
 if write_if_changed /etc/ops-shell.sh 0644 <<'EOF'
 # Managed by ops-scripts (modules/22-cli-tools.sh). Loaded from ~/.bashrc.
@@ -93,3 +120,4 @@ for rc in "${targets[@]}"; do
   fi
 done
 ok "Shell integration enabled"
+(( failed == 0 )) || exit 3 # finished, with problems (bootstrap carries on)

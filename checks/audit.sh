@@ -234,6 +234,44 @@ if command -v tailscale >/dev/null; then
   fi
 fi
 
+# --- Tools ------------------------------------------------------------------
+# Tools chosen in cli-tools / dev-tools, as recorded when they were installed,
+# re-checked now. Dev tools are run as the login user, the way you'd use them.
+if [[ -s "$TOOLS_STATE" ]]; then
+  heading "Tools"
+  cli_ok=0; cli_total=0
+  live_log="$(mktemp)"
+  while IFS=$'\t' read -r name kind status user detail hint _; do
+    [[ -n "$name" ]] || continue
+    out=""
+    fix="tool $name"
+    if [[ "$kind" == cli ]]; then
+      cli_total=$((cli_total + 1))
+      if pkg_installed "$name"; then cli_ok=$((cli_ok + 1)); continue; fi
+      if [[ "$status" == skipped ]]; then
+        check warn "tools.$name" "$name: $detail" "" "$hint"
+        continue
+      fi
+    elif out="$(dev_tool_works "$name" "$user")"; then
+      check pass "tools.$name" "$name works for $user ($out)"
+      continue
+    fi
+    if [[ "$status" == failed ]]; then
+      [[ "$hint" == "Install it again" ]] && hint=""
+      check fail "tools.$name" "$name not installed: $detail" "$fix" "Install $name again${hint:+ ($hint)}"
+    else
+      # Was fine at install time but doesn't work now: explain what we see now.
+      printf '%s\n' "${out:-}" > "$live_log"
+      [[ "$kind" == cli ]] && echo "package $name is no longer installed" >> "$live_log"
+      explain_failure "$live_log" "$name"
+      [[ "$HINT" == "Install it again" ]] && HINT=""
+      check fail "tools.$name" "$name stopped working: $REASON" "$fix" "Install $name again${HINT:+ ($HINT)}"
+    fi
+  done < "$TOOLS_STATE"
+  rm -f "$live_log"
+  (( cli_ok > 0 )) && check pass tools.cli "$cli_ok of $cli_total CLI tools installed"
+fi
+
 # --- EC2 --------------------------------------------------------------------
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://169.254.169.254/latest/meta-data/ 2>/dev/null || true)
 if [[ "$code" == "401" ]]; then

@@ -25,6 +25,7 @@ info()   { printf '%s[%s]%s %s\n' "$C_BLUE" "$(_ts)" "$C_RESET" "$*"; }
 ok()     { printf '%s[%s] OK%s   %s\n' "$C_GREEN" "$(_ts)" "$C_RESET" "$*"; }
 warn()   { printf '%s[%s] WARN%s %s\n' "$C_YELLOW" "$(_ts)" "$C_RESET" "$*" >&2; }
 die()    { printf '%s[%s] FAIL%s %s\n' "$C_RED" "$(_ts)" "$C_RESET" "$*" >&2; exit 1; }
+err()    { printf '%s[%s] FAIL%s %s\n' "$C_RED" "$(_ts)" "$C_RESET" "$*" >&2; }  # like die, but carries on
 section() { printf '\n%s==> %s%s\n' "$C_BOLD" "$*" "$C_RESET"; }
 
 is_true() {
@@ -105,10 +106,19 @@ link_distro_names() {
 # Latest release of a GitHub repo (owner/name) as JSON.
 # Set GITHUB_TOKEN if you hit the API rate limit (60 requests/hour per IP).
 gh_latest_release() {
-  local auth=()
+  local auth=() out code
   [[ -n "${GITHUB_TOKEN:-}" ]] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
-  curl -fsSL ${auth[@]+"${auth[@]}"} "https://api.github.com/repos/$1/releases/latest" \
-    || die "Could not reach the GitHub API for $1 (rate limited? set GITHUB_TOKEN)"
+  if ! out="$(curl -sSL ${auth[@]+"${auth[@]}"} -w '\n%{http_code}' \
+                "https://api.github.com/repos/$1/releases/latest" 2>&1)"; then
+    die "Cannot reach api.github.com for $1: $(tail -1 <<< "$out")"
+  fi
+  code="${out##*$'\n'}"
+  case "$code" in
+    200)     printf '%s\n' "${out%$'\n'*}" ;;
+    403|429) die "GitHub API rate limit reached for $1 (60 requests/hour per IP without GITHUB_TOKEN)" ;;
+    404)     die "No releases found for $1" ;;
+    *)       die "GitHub API returned HTTP $code for $1" ;;
+  esac
 }
 
 # Download one asset of a release and verify its SHA-256 checksum.
@@ -117,11 +127,107 @@ gh_download_asset() { # release_json asset_name dest
   url=$(jq -r --arg n "$2" '.assets[] | select(.name == $n) | .browser_download_url' <<< "$1")
   [[ -n "$url" ]] || die "Release asset '$2' not found"
   digest=$(jq -r --arg n "$2" '.assets[] | select(.name == $n) | .digest // empty' <<< "$1")
-  curl -fsSL "$url" -o "$3"
+  curl -fsSL "$url" -o "$3" || die "Download of $2 failed (network problem?)"
   if [[ "$digest" == sha256:* ]]; then
     echo "${digest#sha256:}  $3" | sha256sum -c --quiet - || die "Checksum mismatch for $2"
   else
     warn "No checksum published for $2; not verified"
+  fi
+}
+
+# --- Tool results --------------------------------------------------------------
+# cli-tools and dev-tools record each tool's result here; checks/audit.sh re-checks
+# them and checks/fix.sh reinstalls them. Columns (tab separated):
+#   name  kind(cli|dev)  status(ok|failed|skipped)  user  detail(version or reason)  hint  time
+TOOLS_STATE=/var/lib/ops-scripts/tools.tsv
+
+_one_line() { tr '\t\n' '  ' <<< "$1" | sed 's/  *$//'; }
+
+tool_record() { # name kind status user detail hint
+  local f
+  mkdir -p "$(dirname "$TOOLS_STATE")"
+  f="$(mktemp)"
+  [[ -f "$TOOLS_STATE" ]] && awk -F'\t' -v n="$1" '$1 != n' "$TOOLS_STATE" > "$f"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$(_one_line "$5")" "$(_one_line "$6")" \
+    "$(date '+%Y-%m-%d %H:%M')" >> "$f"
+  install -m 0644 "$f" "$TOOLS_STATE"
+  rm -f "$f"
+}
+
+# The command a dev tool installs.
+dev_tool_cmd() { case "$1" in neovim|lazyvim) echo nvim ;; *) echo "$1" ;; esac; }
+
+# dev_tool_works NAME USER: prints the version if the tool runs for USER (in a
+# login shell, as they'd use it), otherwise prints why not and returns 1.
+dev_tool_works() {
+  local t="$1" u="$2" c out home runner=()
+  if user_exists "$u"; then runner=(sudo -u "$u" -H); else u=root; fi
+  if [[ "$t" == lazyvim ]]; then
+    home="$(user_home "$u")"
+    [[ -d "$home/.config/nvim" ]] || { echo "No LazyVim config: $home/.config/nvim is missing"; return 1; }
+  fi
+  c="$(dev_tool_cmd "$t")"
+  # shellcheck disable=SC2016 # $PATH must expand in the user's shell
+  if ! out="$(cd / && ${runner[@]+"${runner[@]}"} bash -lc \
+       'command -v "$1" >/dev/null || { echo "$1: command not found for $USER (PATH=$PATH)"; exit 127; }
+        "$1" --version' _ "$c" 2>&1)"; then
+    if [[ "$out" == *"command not found for"* ]] && ! command -v "$c" >/dev/null && [[ ! -e "/usr/local/bin/$c" ]]; then
+      echo "$c is missing: not installed, or removed since"
+    else
+      tail -2 <<< "$out" | tr '\n' ' '; echo
+    fi
+    return 1
+  fi
+  # Just the version number when there is one (lazygit prints commit=..., version=...).
+  out="$(head -1 <<< "$out")"
+  if [[ "$out" =~ ([0-9]+\.[0-9]+(\.[0-9]+)?) ]]; then echo "${BASH_REMATCH[1]}"; else cut -c1-40 <<< "$out"; fi
+}
+
+# explain_failure LOG NAME: sets REASON and HINT from what went wrong in LOG.
+# shellcheck disable=SC2034 # REASON and HINT are read by the caller
+explain_failure() {
+  local log="$1" n="$2" last
+  last="$(grep -E 'FAIL|^E: |[Ee]rror|not found|Permission denied' "$log" 2>/dev/null | tail -1 \
+          | sed -E 's/\x1b\[[0-9;]*m//g; s/^\[[0-9:]+\] FAIL +//')"
+  if grep -qi 'rate limit' "$log"; then
+    REASON="GitHub API rate limit reached (60 requests/hour per IP)"
+    HINT="Wait up to an hour, or add a GitHub token: sudo GITHUB_TOKEN=<token> $OPS_ROOT/checks/fix.sh tool $n"
+  elif grep -qiE 'Cannot reach|Could not resolve|Failed to connect|timed out|Temporary failure resolving|Download of .* failed' "$log"; then
+    REASON="Couldn't download (no internet, DNS, or the site is down)"
+    HINT="Check the internet connection: curl -sI https://github.com | head -1"
+  elif grep -q 'Checksum mismatch' "$log"; then
+    REASON="Download failed its checksum check (corrupted in transit)"
+    HINT="Usually a one-off; if it keeps failing, don't use that release"
+  elif grep -qE "Release asset .* not found" "$log"; then
+    REASON="This release has no build for this CPU ($(uname -m))"
+    HINT="Nothing to fix here; untick $n or wait for a newer release"
+  elif grep -q 'No space left' "$log"; then
+    REASON="Disk full"
+    HINT="Free space first: sudo $OPS_ROOT/checks/fix.sh disk"
+  elif grep -qE 'Could not get lock|dpkg was interrupted' "$log"; then
+    REASON="The package manager is busy or was interrupted"
+    HINT="Run first: sudo dpkg --configure -a"
+  elif grep -qE 'Unable to locate package|has no installation candidate' "$log"; then
+    REASON="Not packaged for this OS version"
+    HINT="Untick $n (remove it from the list)"
+  elif grep -q 'Exec format error' "$log"; then
+    REASON="The installed binary is for a different CPU"
+    HINT="Install it again"
+  elif grep -q 'is missing: not installed' "$log"; then
+    REASON="The program is missing (not installed, or removed since)"
+    HINT="Install it again"
+  elif grep -q 'command not found for' "$log"; then
+    REASON="Installed, but not in the user's PATH"
+    HINT="Open a new SSH session, and check that PATH includes /usr/local/bin"
+  elif grep -qE "ADMIN_USER .* does not exist" "$log"; then
+    REASON="The login user doesn't exist"
+    HINT="Set ADMIN_USER to the user you SSH in as, then retry"
+  elif grep -qiE 'Terminated|Killed|cancel' "$log"; then
+    REASON="Interrupted before it finished"
+    HINT="Run it again and let it finish (LazyVim can take a few minutes)"
+  else
+    REASON="${last:-Failed; see /var/log/ops-bootstrap.log}"
+    HINT="Full output: /var/log/ops-bootstrap.log"
   fi
 }
 

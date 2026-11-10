@@ -26,6 +26,8 @@ Fixes:
   docker-allow P/PROTO  Allow a Docker-published port in UFW, e.g. 443/udp
   nginx-tokens          Hide the nginx version
   tailscale-up          Log in to Tailscale (prints a login URL)
+  tool NAME...          Install these CLI/dev tools again and check that they work,
+                        e.g. tool lazygit herdr
 EOF
 }
 
@@ -37,8 +39,8 @@ require_supported_os
 
 # Fixes that reuse a module must not move SSH to a different port: start from the
 # port sshd uses now. A config file passed via OPS_CONFIG still wins.
-SSH_PORT="$(current_ssh_ports | head -1)"
-export SSH_PORT
+cur_port="$(current_ssh_ports 2>/dev/null | head -1 || true)"
+[[ -n "$cur_port" ]] && export SSH_PORT="$cur_port"
 load_config
 
 MOD="$OPS_ROOT/modules"
@@ -57,7 +59,7 @@ case "$fix" in
     fi
     apt_get autoremove --purge
     ok "Packages updated"
-    [[ -f /var/run/reboot-required ]] && warn "A reboot is required to finish (fix: reboot)"
+    if [[ -f /var/run/reboot-required ]]; then warn "A reboot is required to finish (fix: reboot)"; fi
     ;;
   reboot)
     warn "Rebooting now. Reconnect in about a minute."
@@ -76,7 +78,7 @@ case "$fix" in
     apt_get autoremove --purge
     journalctl --vacuum-size=200M 2>&1 | tail -1
     ok "Free space on /: $before -> $(df --output=avail -h / | tail -1 | tr -d ' ')"
-    command -v docker >/dev/null && info "Docker images can also use a lot of space: 'docker system df' (clean up with care)"
+    if command -v docker >/dev/null; then info "Docker images can also use a lot of space: 'docker system df' (clean up with care)"; fi
     ;;
   ssh-hardening) bash "$MOD/40-ssh-hardening.sh" ;;
   lock-users)
@@ -112,6 +114,26 @@ case "$fix" in
     info "Open the URL below on your laptop and approve this server. Waiting..."
     tailscale up
     ok "Tailscale connected: $(tailscale ip -4)"
+    ;;
+  tool)
+    [[ $# -gt 0 ]] || die "tool needs at least one tool name, e.g. tool lazygit"
+    dev=(); cli=(); user=""
+    for t in "$@"; do
+      [[ "$t" =~ ^[a-z0-9][a-z0-9.+-]*$ ]] || die "Not a valid tool name: $t"
+      line="$(awk -F'\t' -v n="$t" '$1 == n' "$TOOLS_STATE" 2>/dev/null | head -1)"
+      kind="$(cut -f2 <<< "$line")"
+      [[ -n "$line" ]] && user="$(cut -f4 <<< "$line")"
+      case "$kind:$t" in
+        dev:*|:git|:lazygit|:lazydocker|:neovim|:lazyvim|:herdr) dev+=("$t") ;;
+        *) cli+=("$t") ;;
+      esac
+    done
+    # Dev tools go to the same user as before (a config via OPS_CONFIG still wins).
+    [[ -n "$user" && "$user" != root && -z "${OPS_CONFIG:-}" ]] && export ADMIN_USER="$user"
+    rc=0
+    if [[ ${#cli[@]} -gt 0 ]]; then CLI_TOOLS="${cli[*]}" bash "$MOD/22-cli-tools.sh" || rc=$?; fi
+    if [[ ${#dev[@]} -gt 0 ]]; then DEV_TOOLS="${dev[*]}" bash "$MOD/60-dev-tools.sh" || rc=$?; fi
+    exit "$rc"
     ;;
   *)
     usage >&2

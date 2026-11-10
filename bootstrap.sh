@@ -93,6 +93,7 @@ info "OS: $OS_ID $OS_VERSION ($OS_CODENAME), config: ${OPS_CONFIG:-defaults only
 
 ran=()
 skipped=()
+partial=()
 start=$(date +%s)
 
 for f in "${MODULES[@]}"; do
@@ -106,12 +107,23 @@ for f in "${MODULES[@]}"; do
   fi
 
   section "Module: $n"
-  bash "$f" || die "Module '$n' failed. Fix the problem and re-run; finished modules will be skipped quickly."
+  rc=0
+  bash "$f" || rc=$?
+  if (( rc == 3 )); then
+    # Finished, but some optional items failed (it printed why and how to fix).
+    warn "Module '$n' finished with problems; continuing"
+    partial+=("$n")
+  elif (( rc != 0 )); then
+    die "Module '$n' failed. Fix the problem and re-run; finished modules will be skipped quickly."
+  fi
   ran+=("$n")
 done
 
 section "Summary"
 ok "Ran: ${ran[*]:-none}"
+if [[ ${#partial[@]} -gt 0 ]]; then
+  err "Finished with problems: ${partial[*]} (see the reasons above, or run: sudo $OPS_ROOT/checks/audit.sh)"
+fi
 [[ ${#skipped[@]} -gt 0 ]] && info "Skipped: ${skipped[*]}"
 info "Finished in $(( $(date +%s) - start ))s. Log: $LOG_FILE"
 
@@ -127,3 +139,6 @@ if [[ -f /var/run/reboot-required ]]; then
     warn "A reboot is required to finish updates (e.g. new kernel): sudo reboot"
   fi
 fi
+
+# Exit 3: everything ran, but some modules reported problems.
+[[ ${#partial[@]} -eq 0 ]] || exit 3

@@ -413,6 +413,40 @@ Pick items in `DEV_TOOLS`, or tick them in the menu. `git`, `lazygit` and `neovi
 
 If the GitHub API rate-limits you (60 requests per hour per IP), set `GITHUB_TOKEN`: `sudo GITHUB_TOKEN=ghp_… ./bootstrap.sh --only dev-tools`.
 
+### Did every tool install? (checks, reasons and fixes)
+
+Each CLI and dev tool installs **on its own**, so one failure doesn't stop the others. After installing, each dev tool is **run as `ADMIN_USER` in a login shell**, the way you'd use it, to prove it works. A summary ends the module:
+
+```
+Dev tools: each one checked by running it as ubuntu
+OK   git         2.43.0
+OK   lazygit     0.66.3
+FAIL herdr       GitHub API rate limit reached (60 requests/hour per IP)
+                 why: Wait up to an hour, or add a GitHub token: sudo GITHUB_TOKEN=<token> …/checks/fix.sh tool herdr
+                 fix: sudo …/checks/fix.sh tool herdr
+```
+
+When some tools fail, the module finishes with problems and `bootstrap.sh` **carries on** with the next modules. It lists them in the summary and exits with code 3.
+
+Results are saved in `/var/lib/ops-scripts/tools.tsv`. The audit re-checks them every time in a **Tools** section, so you also see tools that broke later, for example one that was deleted. In the UI, press **Enter** on one to reinstall it, and the re-scan confirms it works. Without the UI:
+
+```bash
+sudo checks/fix.sh tool herdr lazygit     # reinstall these and check them again
+```
+
+| Reason shown | What to do |
+|---|---|
+| GitHub API rate limit reached | Wait up to an hour, or retry with `sudo GITHUB_TOKEN=<token> checks/fix.sh tool <name>`. A [fine-grained token](https://github.com/settings/personal-access-tokens) with no permissions is enough |
+| Couldn't download (no internet, DNS…) | `curl -sI https://github.com \| head -1` shows whether the server can reach GitHub |
+| Failed its checksum check | Usually a one-off. Retry |
+| No build for this CPU | That release has no build for your architecture. Untick the tool |
+| Not packaged for this OS version | apt doesn't have it on this Ubuntu/Debian version. Remove it from `CLI_TOOLS` |
+| Package manager busy or interrupted | `sudo dpkg --configure -a`, then retry |
+| Disk full | `sudo checks/fix.sh disk`, then retry |
+| Missing (not installed, or removed since) | Retry |
+| Installed, but not in the user's PATH | Open a new SSH session. `echo $PATH` must include `/usr/local/bin` |
+| Interrupted before it finished | Retry and let it finish. LazyVim's plugin install takes a few minutes |
+
 ---
 
 ## Tailscale
@@ -763,6 +797,7 @@ Helpers in `lib/common.sh`: `info` `ok` `warn` `die` `section`, `is_true`, `apt_
 |---|---|
 | `Could not get lock /var/lib/dpkg/lock` | Shouldn't happen (apt waits up to 10 min). On first boot, unattended-upgrades may be running; wait and re-run |
 | Module failed halfway | Fix the cause and re-run `bootstrap.sh`. Finished modules are skipped quickly |
+| A tool is missing after install | Run **Audit & fix**: the **Tools** section says why each tool failed, and Enter reinstalls it. See [Did every tool install?](#did-every-tool-install-checks-reasons-and-fixes) |
 | certbot failed | DNS not pointing to the server yet, or port 80 closed in the security group |
 | Can't reach the site on port 80/443 | Check the security group first, then `sudo ufw status`, then `sudo ss -tlnp` |
 | `ec2-launch.sh`: SSH never comes up | Your IP changed since the security group was created. Update the SSH rule or pass `--ssh-cidr` |
