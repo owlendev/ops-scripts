@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Starts the ops terminal UI (tui/). Uses bin/ops-linux-<arch>; if it's missing,
+# builds it (when Go is installed) or downloads it from the GitHub release and
+# verifies its checksum.
+#
+#   sudo ./ops [-c client.env]
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="${OPS_RELEASE_REPO:-owlendev/ops-scripts}"
+
+case "$(uname -m)" in
+  x86_64)        ARCH=amd64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+  *) echo "ops: unsupported CPU $(uname -m). Use ./setup.sh instead." >&2; exit 1 ;;
+esac
+BIN="$ROOT/bin/ops-linux-$ARCH"
+
+if [[ ! -x "$BIN" ]]; then
+  mkdir -p "$ROOT/bin"
+  if command -v go >/dev/null; then
+    echo "Building ops for $ARCH..."
+    (cd "$ROOT/tui" && CGO_ENABLED=0 go build -ldflags "-s -w" -o "$BIN" .)
+  else
+    echo "Downloading ops for $ARCH from github.com/$REPO releases..."
+    base="https://github.com/$REPO/releases/latest/download"
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    curl -fsSL "$base/ops-linux-$ARCH" -o "$tmp/ops-linux-$ARCH" \
+      && curl -fsSL "$base/checksums.txt" -o "$tmp/checksums.txt" \
+      || { echo "ops: download failed. Build it with Go, or use ./setup.sh." >&2; exit 1; }
+    (cd "$tmp" && grep " ops-linux-$ARCH\$" checksums.txt | sha256sum -c --quiet -) \
+      || { echo "ops: checksum mismatch, not installing." >&2; exit 1; }
+    install -m 0755 "$tmp/ops-linux-$ARCH" "$BIN"
+  fi
+fi
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  exec sudo "$BIN" --root "$ROOT" "$@"
+fi
+exec "$BIN" --root "$ROOT" "$@"

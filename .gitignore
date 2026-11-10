@@ -3,3 +3,7 @@
 *.key
 clients/
 *.local.env
+
+# Built TUI binaries (build with ./ops or download from releases)
+bin/
+dist/

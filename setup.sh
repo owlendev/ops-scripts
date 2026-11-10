@@ -82,6 +82,7 @@ plocate|locate: instant file name search"
 
 DEV_CATALOG="git|git + git-lfs with sane defaults (name/email from settings)
 lazygit|terminal UI for git
+lazydocker|terminal UI for Docker containers and logs
 neovim|latest Neovim from the official release
 lazyvim|LazyVim config for ADMIN_USER (adds Neovim)
 herdr|terminal multiplexer for coding agents"

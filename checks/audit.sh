@@ -1,128 +1,253 @@
 #!/usr/bin/env bash
 # Read-only security/health report. Changes nothing.
+# Checks that can be fixed name a fix from checks/fix.sh.
+#
+#   sudo checks/audit.sh          human-readable report
+#   sudo checks/audit.sh --json   one JSON object per line (used by the ops TUI)
+#
 # Exit code: 0 = no failures, 1 = at least one FAIL.
 set -uo pipefail
 # shellcheck source=../lib/common.sh
 . "$(dirname "$0")/../lib/common.sh"
 require_root; require_supported_os; load_config
 
-PASS=0; WARNS=0; FAILS=0
-pass()  { printf '  %sPASS%s %s\n' "$C_GREEN" "$C_RESET" "$*"; PASS=$((PASS + 1)); }
-check_warn() { printf '  %sWARN%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; WARNS=$((WARNS + 1)); }
-fail()  { printf '  %sFAIL%s %s\n' "$C_RED" "$C_RESET" "$*"; FAILS=$((FAILS + 1)); }
-note()  { printf '  %s\n' "$*"; }
+JSON=0
+[[ "${1:-}" == "--json" ]] && JSON=1
 
-section "Audit: $(hostname) — $OS_ID $OS_VERSION — kernel $(uname -r)"
+PASS=0; WARNS=0; FAILS=0
+SECTION=""
+
+json_str() {
+  local s="$1"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"; s="${s//$'\t'/\\t}"; s="${s//$'\r'/}"
+  printf '"%s"' "$s"
+}
+
+heading() {
+  SECTION="$1"
+  if (( JSON )); then printf '{"type":"section","title":%s}\n' "$(json_str "$1")"
+  else printf '\n%s\n' "$1"; fi
+}
+
+# Informational line (no status).
+detail() {
+  if (( JSON )); then
+    printf '{"type":"info","section":%s,"message":%s}\n' "$(json_str "$SECTION")" "$(json_str "$1")"
+  else
+    printf '  %s\n' "$1"
+  fi
+}
+
+# check STATUS ID MESSAGE [FIX] [FIX_DESCRIPTION] [RISK]
+#   STATUS: pass | warn | fail
+#   FIX:    arguments for checks/fix.sh, e.g. "rpcbind" or "docker-allow 443/udp"
+#   RISK:   safe (default) | caution (restarts SSH, opens a port, reboots...)
+check() {
+  local status="$1" id="$2" msg="$3" fix="${4:-}" desc="${5:-}" risk="${6:-safe}"
+  case "$status" in
+    pass) PASS=$((PASS + 1)); fix="" ;;
+    warn) WARNS=$((WARNS + 1)) ;;
+    fail) FAILS=$((FAILS + 1)) ;;
+  esac
+  if (( JSON )); then
+    printf '{"type":"check","section":%s,"id":%s,"status":%s,"message":%s,"fix":%s,"fix_desc":%s,"risk":%s}\n' \
+      "$(json_str "$SECTION")" "$(json_str "$id")" "$(json_str "$status")" "$(json_str "$msg")" \
+      "$(json_str "$fix")" "$(json_str "$desc")" "$(json_str "$risk")"
+    return
+  fi
+  local label color
+  case "$status" in
+    pass) label=PASS color="$C_GREEN" ;;
+    warn) label=WARN color="$C_YELLOW" ;;
+    fail) label=FAIL color="$C_RED" ;;
+  esac
+  printf '  %s%s%s %s\n' "$color" "$label" "$C_RESET" "$msg"
+  if [[ -n "$fix" ]]; then
+    printf '       fix: %s  ->  sudo %s/checks/fix.sh %s\n' "$desc" "$OPS_ROOT" "$fix"
+  elif [[ -n "$desc" ]]; then
+    printf '       how: %s\n' "$desc"
+  fi
+}
+
+(( JSON )) || section "Audit: $(hostname) — $OS_ID $OS_VERSION — kernel $(uname -r)"
 
 # --- System -----------------------------------------------------------------
-echo "System"
-note "uptime: $(uptime -p)"
-if [[ -f /var/run/reboot-required ]]; then check_warn "Reboot required"; else pass "No reboot required"; fi
+heading "System"
+detail "uptime: $(uptime -p)"
+if [[ -f /var/run/reboot-required ]]; then
+  check warn system.reboot "Reboot required to finish updates" \
+    reboot "Reboot now (you'll be disconnected for about a minute)" caution
+else
+  check pass system.reboot "No reboot required"
+fi
 
 upgradable=$(apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null | grep -c '^Inst' || true)
 security=$(apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null | grep '^Inst' | grep -ci security || true)
-if (( security > 0 )); then fail "$security pending security update(s) ($upgradable total)"
-elif (( upgradable > 0 )); then check_warn "$upgradable pending update(s), none security"
-else pass "All packages up to date"; fi
+if (( security > 0 )); then
+  check fail system.updates "$security pending security update(s) ($upgradable total)" updates "Install all pending updates"
+elif (( upgradable > 0 )); then
+  check warn system.updates "$upgradable pending update(s), none security" updates "Install all pending updates"
+else
+  check pass system.updates "All packages up to date"
+fi
 
 if [[ "$(apt-config dump APT::Periodic::Unattended-Upgrade 2>/dev/null)" == *'"1"'* ]]; then
-  pass "Unattended upgrades enabled"
+  check pass system.auto-updates "Unattended upgrades enabled"
 else
-  check_warn "Unattended upgrades not enabled"
+  check warn system.auto-updates "Unattended upgrades not enabled" auto-updates "Enable daily automatic security updates"
 fi
 
 if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]]; then
-  pass "Clock synchronized (timezone $(timedatectl show -p Timezone --value))"
+  check pass system.clock "Clock synchronized (timezone $(timedatectl show -p Timezone --value))"
 else
-  check_warn "Clock not synchronized"
+  check warn system.clock "Clock not synchronized" ntp "Turn on network time sync"
 fi
 
 root_use=$(df --output=pcent / | tail -1 | tr -dc '0-9')
-if (( root_use >= 90 )); then fail "Root disk ${root_use}% full"
-elif (( root_use >= 80 )); then check_warn "Root disk ${root_use}% full"
-else pass "Root disk ${root_use}% used"; fi
+if (( root_use >= 90 )); then
+  check fail system.disk "Root disk ${root_use}% full" disk "Free space: clean apt cache, old packages and journal logs"
+elif (( root_use >= 80 )); then
+  check warn system.disk "Root disk ${root_use}% full" disk "Free space: clean apt cache, old packages and journal logs"
+else
+  check pass system.disk "Root disk ${root_use}% used"
+fi
 
-mem=$(free -h | awk '/^Mem:/ {print $3"/"$2}')
-swap=$(free -h | awk '/^Swap:/ {print $2}')
-note "memory used: $mem, swap: $swap"
+detail "memory used: $(free -h | awk '/^Mem:/ {print $3"/"$2}'), swap: $(free -h | awk '/^Swap:/ {print $2}')"
 
 # --- SSH --------------------------------------------------------------------
-echo; echo "SSH"
+heading "SSH"
 mkdir -p /run/sshd
 sshd_conf="$(sshd -T 2>/dev/null)"
 sshd_opt() { awk -v k="$1" '$1 == k { print $2; exit }' <<< "$sshd_conf"; }
+SSH_FIX_DESC="Apply SSH hardening: keys only, no root login (refuses if you have no SSH key)"
 
-[[ "$(sshd_opt permitrootlogin)" == "no" ]] && pass "Root login disabled" || fail "Root login allowed (permitrootlogin $(sshd_opt permitrootlogin))"
-[[ "$(sshd_opt passwordauthentication)" == "no" ]] && pass "Password login disabled" || fail "Password login enabled"
-[[ "$(sshd_opt kbdinteractiveauthentication)" == "no" ]] && pass "Keyboard-interactive login disabled" || check_warn "Keyboard-interactive login enabled"
-[[ "$(sshd_opt x11forwarding)" == "no" ]] && pass "X11 forwarding disabled" || check_warn "X11 forwarding enabled"
-note "listening on port(s): $(current_ssh_ports | tr '\n' ' ')"
+if [[ "$(sshd_opt permitrootlogin)" == "no" ]]; then check pass ssh.root-login "Root login disabled"
+else check fail ssh.root-login "Root login allowed (permitrootlogin $(sshd_opt permitrootlogin))" ssh-hardening "$SSH_FIX_DESC" caution; fi
+
+if [[ "$(sshd_opt passwordauthentication)" == "no" ]]; then check pass ssh.password "Password login disabled"
+else check fail ssh.password "Password login enabled" ssh-hardening "$SSH_FIX_DESC" caution; fi
+
+if [[ "$(sshd_opt kbdinteractiveauthentication)" == "no" ]]; then check pass ssh.kbd "Keyboard-interactive login disabled"
+else check warn ssh.kbd "Keyboard-interactive login enabled" ssh-hardening "$SSH_FIX_DESC" caution; fi
+
+if [[ "$(sshd_opt x11forwarding)" == "no" ]]; then check pass ssh.x11 "X11 forwarding disabled"
+else check warn ssh.x11 "X11 forwarding enabled" ssh-hardening "$SSH_FIX_DESC" caution; fi
+
+detail "listening on port(s): $(current_ssh_ports | tr '\n' ' ')"
 
 # --- Accounts ---------------------------------------------------------------
-echo; echo "Accounts"
-uid0=$(awk -F: '$3 == 0 && $1 != "root" { print $1 }' /etc/passwd)
-[[ -z "$uid0" ]] && pass "Only root has UID 0" || fail "Other UID 0 accounts: $uid0"
-empty=$(awk -F: '$2 == "" { print $1 }' /etc/shadow)
-[[ -z "$empty" ]] && pass "No accounts with empty passwords" || fail "Accounts with empty passwords: $empty"
-note "users with a login shell: $(awk -F: '$7 !~ /(nologin|false|sync|halt|shutdown)$/ { printf "%s ", $1 }' /etc/passwd)"
-note "sudo group: $(getent group sudo | cut -d: -f4)"
+heading "Accounts"
+uid0=$(awk -F: '$3 == 0 && $1 != "root" { printf "%s ", $1 }' /etc/passwd)
+if [[ -z "$uid0" ]]; then check pass accounts.uid0 "Only root has UID 0"
+else check fail accounts.uid0 "Other UID 0 accounts: ${uid0% }" "" \
+  "Investigate first, this can mean a compromise. Then: sudo userdel <name>"; fi
+
+empty=$(awk -F: '$2 == "" { printf "%s ", $1 }' /etc/shadow)
+if [[ -z "$empty" ]]; then check pass accounts.empty-password "No accounts with empty passwords"
+else check fail accounts.empty-password "Accounts with empty passwords: ${empty% }" \
+  "lock-users ${empty% }" "Lock these accounts' passwords (SSH keys still work)" caution; fi
+
+detail "users with a login shell: $(awk -F: '$7 !~ /(nologin|false|sync|halt|shutdown)$/ { printf "%s ", $1 }' /etc/passwd)"
+detail "sudo group: $(getent group sudo | cut -d: -f4)"
 
 # --- Firewall / intrusion prevention ----------------------------------------
-echo; echo "Firewall"
+heading "Firewall"
 if command -v ufw >/dev/null && ufw status | grep -q 'Status: active'; then
-  pass "UFW active"
-  ufw status | sed -n '/^--/,$p' | tail -n +2 | grep . | sed 's/^/      /'
+  check pass firewall.ufw "UFW active"
+  while IFS= read -r rule; do detail "  $rule"; done < <(ufw status | sed -n '/^--/,$p' | tail -n +2 | grep .)
 else
-  fail "UFW not active"
+  check fail firewall.ufw "UFW not active" firewall \
+    "Enable UFW: deny inbound except SSH (current port kept open), HTTP and HTTPS" caution
 fi
 
 if systemctl is-active --quiet fail2ban 2>/dev/null; then
   banned=$(fail2ban-client status sshd 2>/dev/null | awk -F: '/Currently banned/ { gsub(/[[:space:]]/, "", $2); print $2 }')
-  pass "fail2ban active (sshd currently banned: ${banned:-0})"
+  check pass firewall.fail2ban "fail2ban active (sshd currently banned: ${banned:-0})"
 else
-  check_warn "fail2ban not running"
+  check warn firewall.fail2ban "fail2ban not running" fail2ban "Install and start fail2ban for SSH"
 fi
 
 # --- Network exposure -------------------------------------------------------
-echo; echo "Listening ports (not localhost)"
-ss -tulnpH 2>/dev/null \
-  | awk '$5 !~ /^(127\.|\[::1\]|::1)/ { split($7, p, "\""); printf "      %-4s %-28s %s\n", $1, $5, p[2] }' \
-  | sort -u
+heading "Network"
+if ! command -v ss >/dev/null; then
+  check warn network.ss "Can't inspect open ports: the 'ss' tool (iproute2) is missing" \
+    install-iproute2 "Install iproute2 so the audit can check listening ports"
+else
+detail "listening ports (not localhost):"
+# Skip the DHCP client (udp 68), which every cloud VM has.
+while IFS= read -r line; do detail "  $line"; done < <(
+  ss -tulnpH 2>/dev/null \
+    | awk '$5 !~ /^(127\.|\[::1\]|::1)/ && !($1 == "udp" && $5 ~ /:68$/) { split($7, p, "\""); printf "%-4s %-28s %s\n", $1, $5, p[2] }' \
+    | sort -u)
+
+if ss -tulnH 2>/dev/null | awk '{print $5}' | grep -Eq '^(0\.0\.0\.0|\[::\]|\*):111$'; then
+  check warn network.rpcbind "rpcbind listens on port 111 (only needed for NFS)" rpcbind "Stop and disable rpcbind"
+else
+  check pass network.rpcbind "rpcbind not exposed"
+fi
+fi
 
 if command -v docker >/dev/null && systemctl is-active --quiet docker; then
-  exposed=$(docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null | grep -E '0\.0\.0\.0:|:::' || true)
-  if [[ -n "$exposed" ]]; then
-    check_warn "Docker containers publishing on all interfaces (bypasses UFW):"
-    sed 's/^/      /' <<< "$exposed"
-  else
-    pass "No Docker containers publishing on all interfaces"
+  # Docker-published ports skip UFW. That's fine for ports UFW allows anyway
+  # (e.g. 80/443 on a reverse proxy); flag only the others.
+  ufw_allowed=" $(ufw status 2>/dev/null | awk '$2 ~ /^(ALLOW|LIMIT)$/ && $1 ~ /^[0-9]+(\/(tcp|udp))?$/ {printf "%s ", $1}') "
+  expected=()
+  flagged=0
+  while IFS=$'\t' read -r cname ports; do
+    # shellcheck disable=SC2013  # tokens like 443/udp never contain spaces
+    for pp in $(grep -oE '(0\.0\.0\.0|\[::\]|::):[0-9-]+->[0-9-]+/(tcp|udp)' <<< "$ports" \
+                | sed -E 's/^.*:([0-9-]+)->[0-9-]+\/(tcp|udp)$/\1\/\2/' | sort -u); do
+      if [[ "$ufw_allowed" == *" $pp "* || "$ufw_allowed" == *" ${pp%/*} "* ]]; then
+        expected+=("$pp")
+      else
+        flagged=1
+        check warn "network.docker-port.$pp" "Container $cname publishes $pp to the internet, but UFW doesn't allow it (Docker bypasses UFW)" \
+          "docker-allow $pp" "It's meant to be public: allow $pp in UFW so the firewall matches. (Not meant to be public? Publish it as 127.0.0.1:PORT instead.)" caution
+      fi
+    done
+  done < <(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null)
+
+  if (( ! flagged )); then
+    if [[ ${#expected[@]} -gt 0 ]]; then
+      check pass network.docker "Docker publishes only ports UFW also allows: $(printf '%s\n' "${expected[@]}" | sort -u | tr '\n' ' ')"
+    else
+      check pass network.docker "No Docker containers publish ports to the internet"
+    fi
   fi
 fi
 
 if command -v nginx >/dev/null; then
-  nginx -T 2>/dev/null | grep -qE '^\s*server_tokens\s+off' && pass "nginx hides its version" || check_warn "nginx server_tokens not off"
+  if nginx -T 2>/dev/null | grep -qE '^\s*server_tokens\s+off'; then check pass network.nginx-tokens "nginx hides its version"
+  else check warn network.nginx-tokens "nginx shows its version in responses" nginx-tokens "Set server_tokens off and reload nginx"; fi
 fi
 
 # --- Tailscale --------------------------------------------------------------
 if command -v tailscale >/dev/null; then
-  echo; echo "Tailscale"
+  heading "Tailscale"
   if tailscale_online; then
     ts_name=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' 2>/dev/null | sed 's/\.$//')
-    pass "Connected: $(tailscale ip -4 2>/dev/null) ${ts_name}"
+    check pass tailscale.online "Connected: $(tailscale ip -4 2>/dev/null) ${ts_name}"
   else
-    check_warn "Installed but not connected (sudo tailscale up)"
+    check warn tailscale.online "Installed but not connected" tailscale-up \
+      "Log in: prints a URL, open it on your laptop and approve this server"
   fi
 fi
 
 # --- EC2 --------------------------------------------------------------------
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://169.254.169.254/latest/meta-data/ 2>/dev/null || true)
 if [[ "$code" == "401" ]]; then
-  echo; echo "EC2"; pass "IMDSv2 enforced (metadata requires a token)"
+  heading "EC2"; check pass ec2.imdsv2 "IMDSv2 enforced (metadata requires a token)"
 elif [[ "$code" == "200" ]]; then
-  echo; echo "EC2"; check_warn "IMDSv1 allowed. Enforce v2: aws ec2 modify-instance-metadata-options --instance-id <id> --http-tokens required"
+  heading "EC2"; check warn ec2.imdsv2 "IMDSv1 allowed" "" \
+    "From your machine: aws ec2 modify-instance-metadata-options --instance-id <id> --http-tokens required"
 fi
 
 # --- Result -----------------------------------------------------------------
-echo
-printf '%sResult:%s %d pass, %d warn, %d fail\n' "$C_BOLD" "$C_RESET" "$PASS" "$WARNS" "$FAILS"
+if (( JSON )); then
+  printf '{"type":"summary","pass":%d,"warn":%d,"fail":%d}\n' "$PASS" "$WARNS" "$FAILS"
+else
+  echo
+  printf '%sResult:%s %d pass, %d warn, %d fail\n' "$C_BOLD" "$C_RESET" "$PASS" "$WARNS" "$FAILS"
+fi
 (( FAILS == 0 ))

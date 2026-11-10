@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Dev tools: git setup, lazygit, Neovim, LazyVim, herdr.
+# Dev tools: git, lazygit, lazydocker, Neovim, LazyVim, herdr.
 # Installed from official releases (checksums verified); configs go to ADMIN_USER.
 set -euo pipefail
 # shellcheck source=../lib/common.sh
@@ -12,14 +12,14 @@ want() { [[ " $DEV_TOOLS " == *" $1 "* ]]; }
 want lazyvim && ! want neovim && DEV_TOOLS="$DEV_TOOLS neovim"
 
 for t in $DEV_TOOLS; do
-  case "$t" in git|lazygit|neovim|lazyvim|herdr) ;; *) warn "Unknown DEV_TOOLS entry '$t', ignored" ;; esac
+  case "$t" in git|lazygit|lazydocker|neovim|lazyvim|herdr) ;; *) warn "Unknown DEV_TOOLS entry '$t', ignored" ;; esac
 done
 
 ensure_packages ca-certificates curl jq tar gzip
 
 case "$(uname -m)" in
-  x86_64)  ARCH_NVIM=x86_64 ARCH_LG=x86_64 ARCH_TS=x64   ARCH_HERDR=x86_64 ;;
-  aarch64) ARCH_NVIM=arm64  ARCH_LG=arm64  ARCH_TS=arm64 ARCH_HERDR=aarch64 ;;
+  x86_64)  ARCH_NVIM=x86_64 ARCH_LG=x86_64 ARCH_LD=x86_64 ARCH_TS=x64   ARCH_HERDR=x86_64 ;;
+  aarch64) ARCH_NVIM=arm64  ARCH_LG=arm64  ARCH_LD=arm64  ARCH_TS=arm64 ARCH_HERDR=aarch64 ;;
   *) die "Unsupported architecture: $(uname -m)" ;;
 esac
 
@@ -58,6 +58,20 @@ install_lazygit() {
   tar -xzf "$tmp/lazygit.tar.gz" -C "$tmp" lazygit
   install -m 0755 "$tmp/lazygit" /usr/local/bin/lazygit
   ok "lazygit $ver installed"
+}
+
+install_lazydocker() {
+  local json ver
+  json="$(gh_latest_release jesseduffield/lazydocker)"
+  ver="$(jq -r .tag_name <<< "$json")"; ver="${ver#v}"
+  if command -v lazydocker >/dev/null && lazydocker --version | grep -qF "Version: $ver"; then
+    ok "lazydocker $ver already installed"; return
+  fi
+  gh_download_asset "$json" "lazydocker_${ver}_Linux_${ARCH_LD}.tar.gz" "$tmp/lazydocker.tar.gz"
+  tar -xzf "$tmp/lazydocker.tar.gz" -C "$tmp" lazydocker
+  install -m 0755 "$tmp/lazydocker" /usr/local/bin/lazydocker
+  ok "lazydocker $ver installed (run it as root, or as a user in the docker group)"
+  command -v docker >/dev/null || warn "Docker isn't installed yet; lazydocker needs it (module: docker)"
 }
 
 install_neovim() {
@@ -127,6 +141,7 @@ install_herdr() {
 
 want git     && install_git
 want lazygit && install_lazygit
+want lazydocker && install_lazydocker
 want neovim  && install_neovim
 want lazyvim && install_lazyvim
 want herdr   && install_herdr

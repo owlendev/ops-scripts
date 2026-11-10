@@ -5,25 +5,27 @@ Prepare fresh Ubuntu/Debian servers (mainly AWS EC2) for client work: updated, h
 This repo is only for **preparing** a server. Deploying the client's application is a separate step/repo.
 
 ```
-fresh EC2 ──► setup.sh (menu)  ─┐
-          └─► bootstrap.sh -c   ─┴─► updated · firewalled · SSH keys only · fail2ban · auto security updates
-                                     (+ optional: modern CLI tools, Neovim/LazyVim, lazygit, herdr,
-                                        nginx/HTTPS, Docker, AWS CLI)
+fresh server ──► ./ops (terminal UI) ─┐
+             └─► bootstrap.sh -c      ─┴─► updated · firewalled · SSH keys only · fail2ban · auto security updates
+                                           (+ optional: modern CLI tools, Neovim/LazyVim, lazygit, lazydocker, herdr,
+                                              Tailscale, nginx/HTTPS, Docker, AWS CLI)
 ```
 
-There are two ways to drive it, and they use the same modules:
+There are two ways to drive it, and they use the same bash modules:
 
-- **`sudo ./setup.sh`**: an interactive menu with checklists. Use it when you're on the server doing things by hand.
+- **`sudo ./ops`**: a terminal UI. Use it when you're on the server doing things by hand. It has a guided setup with checklists, live progress, and **Audit & fix**: it finds problems and fixes each one when you press Enter.
 - **`sudo ./bootstrap.sh [-c config.env]`**: no questions asked. Use it for repeatable setups, scripts and (later) Terraform.
 
-The menu can save your choices as a config file, so you can reuse them with `bootstrap.sh` next time.
+The UI can save your choices as a config file, so you can reuse them with `bootstrap.sh` next time. All the logic lives in the bash scripts. The UI (written in Go, in `tui/`) only shows them and runs them.
 
 ---
 
 ## Contents
 
 - [Layout](#layout)
-- [Interactive menu](#interactive-menu)
+- [The ops terminal UI](#the-ops-terminal-ui)
+  - [Audit & fix](#audit--fix)
+  - [Building and releases](#building-and-releases)
 - [Quick start](#quick-start)
   - [A. Launch + prepare a new EC2 instance in one command](#a-launch--prepare-a-new-ec2-instance-in-one-command)
   - [B. Prepare an existing server from your machine](#b-prepare-an-existing-server-from-your-machine)
@@ -47,8 +49,11 @@ The menu can save your choices as a config file, so you can reuse them with `boo
 
 ```
 ops-scripts/
-├── setup.sh                # Interactive menu: checklists → run (run ON the server)
+├── ops                     # Starts the terminal UI (run ON the server: sudo ./ops)
 ├── bootstrap.sh            # Non-interactive: runs the enabled modules in order (run ON the server)
+├── setup.sh                # Fallback menu (whiptail) for when the ops binary isn't available
+├── tui/                    # Source of the ops terminal UI (Go)
+├── bin/                    # Built ops binaries (git-ignored; tui/build.sh or GitHub releases)
 ├── config/
 │   └── default.env         # All settings and their defaults
 ├── lib/
@@ -63,13 +68,14 @@ ops-scripts/
 │   ├── 45-fail2ban.sh
 │   ├── 50-auto-updates.sh
 │   ├── 55-kernel-hardening.sh
-│   ├── 60-dev-tools.sh     # optional: git setup, lazygit, Neovim, LazyVim, herdr
+│   ├── 60-dev-tools.sh     # optional: git setup, lazygit, lazydocker, Neovim, LazyVim, herdr
 │   ├── 65-tailscale.sh     # optional: private VPN access, Tailscale SSH
 │   ├── 70-docker.sh        # optional
 │   ├── 75-aws-cli.sh       # optional
 │   └── 80-nginx.sh         # optional (+ certbot / HTTPS)
 ├── checks/
-│   └── audit.sh            # Read-only security/health report
+│   ├── audit.sh            # Read-only security/health report (--json for the UI)
+│   └── fix.sh              # One fix per audit problem (the UI runs these on Enter)
 ├── tools/                  # Run FROM YOUR MACHINE, not on the server
 │   ├── ec2-launch.sh       # Security group + instance + bootstrap
 │   ├── ec2-terminate.sh    # Remove everything ec2-launch.sh created
@@ -84,47 +90,101 @@ ops-scripts/
 
 ---
 
-## Interactive menu
+## The ops terminal UI
 
-The easiest way to prepare a server by hand: create the instance in the AWS console, SSH in, and run:
-
-```bash
-git clone <this-repo> ops-scripts && cd ops-scripts
-sudo ./setup.sh
-```
-
-```
-┌──────────── ops-scripts - web1 ─────────────┐
-│ What do you want to do?                     │
-│                                             │
-│   setup   Guided setup: choose modules,     │
-│           tools, settings > run             │
-│   module  Run a single module               │
-│   audit   Security audit (read-only)        │
-│   secret  Generate a secret or password     │
-│   status  Show current choices              │
-│   exit    Exit                              │
-└─────────────────────────────────────────────┘
-```
-
-**Guided setup** goes through these screens:
-
-1. **Modules checklist.** Tick what you want. The defaults are pre-ticked.
-2. **CLI tools checklist** (if `cli-tools` is ticked): pick individual tools.
-3. **Dev tools checklist** (if `dev-tools` is ticked): git, lazygit, Neovim, LazyVim, herdr.
-4. **Settings.** Only the settings for the modules you picked are shown (timezone, hostname, SSH port, HTTPS domains, git name/email…). Values are checked before they're accepted.
-5. **Review.** A summary with warnings, for example if the SSH port changes or your user has no SSH key. Then **Run now** or **Back**.
-6. **Save?** You can save the choices as a config file (default `config/saved.local.env`, git-ignored).
-
-**Keys:** arrows move · **Space** ticks a box · **Enter** confirms · **Tab** jumps to the buttons · **Esc** goes back.
-
-Other ways to open it:
+The easiest way to prepare a server by hand: create the instance in your cloud console, SSH in, and run:
 
 ```bash
-sudo ./setup.sh -c clients/acme.env      # start with this config's choices pre-ticked
-sudo ./bootstrap.sh -i                   # same menu
-tools/push-and-run.sh -i key.pem ubuntu@host -- --interactive   # copy repo + open the menu remotely
+git clone https://github.com/owlendev/ops-scripts.git && cd ops-scripts
+sudo ./ops
 ```
+
+`./ops` picks the binary for your CPU (amd64 or arm64) from `bin/`. If it isn't there yet, it builds it (when Go is installed) or downloads it from the [latest GitHub release](https://github.com/owlendev/ops-scripts/releases) and verifies its SHA-256 checksum. The binary is a single static file with nothing to install.
+
+```
+ ops  web1                                        Ubuntu 24.04 LTS · 10.0.0.13 · arm64
+──────────────────────────────────────────────────────────────────────────────────────
+  What do you want to do?
+
+ ┃ Guided setup
+    Pick modules, tools and settings, then run them
+
+   Audit & fix
+    Check security and health, then fix problems with Enter
+
+   Run a module
+    Run a single module on its own
+
+   Generate a secret
+    App secrets, database passwords, SSH key help
+```
+
+| Screen | What it does |
+|---|---|
+| **Guided setup** | Modules checklist (defaults pre-ticked), then CLI tools and dev tools checklists, then settings, but only those for the modules you picked. Values are checked as you type: user exists, valid timezone, port 1–65535… Ends with a review, an optional **save as config file**, and **Run now**. |
+| **Audit & fix** | Scans the server and lists every check. Problems have a **[fix]** you apply with **Enter**. [More below.](#audit--fix) |
+| **Run a module** | Run one module on its own, e.g. just `tailscale` or `nginx`. |
+| **Generate a secret** | App/JWT secrets, DB passwords, URL-safe and typeable passwords, made with Go's `crypto/rand`. Press **c** to copy to *your* clipboard, even over SSH (needs a terminal with OSC 52 support: kitty, Ghostty, WezTerm, iTerm2, Windows Terminal…). |
+
+While modules or fixes run you see live output and a ✓/✗ per module. Scroll with the arrow keys or PgUp/PgDn, and press **Ctrl-C** to cancel.
+
+Other ways to start it:
+
+```bash
+sudo ./ops -c clients/acme.env           # start from a client config (its choices pre-ticked)
+tools/push-and-run.sh -i key.pem ubuntu@host -- --interactive   # copy repo + open the whiptail menu remotely
+sudo ./setup.sh                          # fallback whiptail menu, no binary needed
+```
+
+### Audit & fix
+
+```
+  Audit & fix   ✓ 9 pass  ! 2 warn  ✗ 3 fail
+  ✓ Fixed 4 issue(s). Verified by a fresh scan.
+
+  SSH
+ ┃ ✗ Password login enabled  [fix]
+   ! X11 forwarding enabled  [fix]
+  NETWORK
+   ! rpcbind listens on port 111 (only needed for NFS)  [fix]
+  ╭──────────────────────────────────────────────────────────────────╮
+  │ ✗ Password login enabled                                         │
+  │ Fix: Apply SSH hardening: keys only, no root login               │
+  │ Risk: careful (asks before running)   Enter to fix               │
+  ╰──────────────────────────────────────────────────────────────────╯
+```
+
+- **Enter** on a problem shows exactly what will run (`checks/fix.sh <fix>`). **Enter** again applies it, **Esc** cancels.
+- After a fix, the server is **scanned again automatically** and you're told whether it's really fixed. If it isn't, the fix's output stays on screen so you can see why.
+- **a** applies all **safe** fixes in one go: updates, auto-updates, fail2ban, NTP, disk cleanup… "Careful" fixes are never included in that, so you apply those one by one: SSH, firewall, reboot, opening a port, locking accounts. They show a warning first.
+- **p** shows problems only, **r** re-scans.
+- Some problems have no automatic fix, for example an unexpected UID-0 account, which could mean a compromise. Those show **[how]** with manual instructions.
+
+The fixes are plain bash in `checks/fix.sh`, so they work without the UI too:
+
+```bash
+sudo checks/fix.sh --list
+sudo checks/fix.sh rpcbind
+sudo checks/fix.sh docker-allow 443/udp
+```
+
+The plain `checks/audit.sh` report prints the matching `fix:` command under every problem.
+
+### Building and releases
+
+```bash
+tui/build.sh          # builds bin/ops-linux-amd64 and bin/ops-linux-arm64 (needs Go 1.24+)
+```
+
+`tools/push-and-run.sh` copies `bin/` to the server too, so building on your laptop before pushing is enough.
+
+To publish binaries for `./ops` to download, push a version tag. The GitHub Actions workflow (`.github/workflows/release.yml`) builds both architectures and attaches them with `checksums.txt`:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+The UI uses Charm's [Bubble Tea](https://github.com/charmbracelet/bubbletea), [huh](https://github.com/charmbracelet/huh) and [Lip Gloss](https://github.com/charmbracelet/lipgloss). Each screen is one file in `tui/`: `audit.go`, `setup.go`, `run.go`, `pages.go`. To add a check with a fix, add a `check` line in `checks/audit.sh` and a case in `checks/fix.sh`. The UI picks it up automatically.
 
 ---
 
@@ -243,7 +303,7 @@ They run in numeric order. All of them are **idempotent**, so re-running only ch
 | `fail2ban` | on | Bans IPs after 5 failed SSH logins in 10 min, for 1 hour |
 | `auto-updates` | on | unattended-upgrades for daily security updates (auto reboot off by default) |
 | `kernel-hardening` | on | sysctl: SYN cookies, no ICMP redirects/source routing, log martians, restrict dmesg/kernel pointers |
-| `dev-tools` | off | git setup, lazygit, latest Neovim, LazyVim, herdr, all for `ADMIN_USER` (see [Tools installed](#tools-installed)) |
+| `dev-tools` | off | git setup, lazygit, lazydocker, latest Neovim, LazyVim, herdr, all for `ADMIN_USER` (see [Tools installed](#tools-installed)) |
 | `tailscale` | off | Tailscale from its official repo, UFW rules for the tailnet, optional auto-login, Tailscale SSH, and closing public SSH (see [Tailscale](#tailscale)) |
 | `docker` | off | Docker Engine + compose/buildx plugins from Docker's repo, log rotation, admin user in `docker` group |
 | `aws-cli` | off | AWS CLI v2 |
@@ -282,12 +342,13 @@ The shell helpers (`CLI_SHELL_INTEGRATION=yes`) live in `/etc/ops-shell.sh` and 
 
 ### `dev-tools` (off by default)
 
-Pick items in `DEV_TOOLS`, or tick them in the menu. Binaries come from the projects' **official GitHub releases**, and each download is checked against the SHA-256 checksum published with the release. Re-running only updates a tool when there's a newer release.
+Pick items in `DEV_TOOLS`, or tick them in the menu. `git`, `lazygit` and `neovim` are ticked by default; `lazydocker`, `lazyvim` and `herdr` are in the list but you tick them yourself. Binaries come from the projects' **official GitHub releases**, and each download is checked against the SHA-256 checksum published with the release. Re-running only updates a tool when there's a newer release.
 
 | Item | What you get |
 |---|---|
 | `git` | git + git-lfs. For `ADMIN_USER`: `init.defaultBranch main`, `push.autoSetupRemote`, `fetch.prune`, delta as pager, and your `GIT_USER_NAME` / `GIT_USER_EMAIL` |
 | `lazygit` | [lazygit](https://github.com/jesseduffield/lazygit), a terminal UI for git, in `/usr/local/bin` |
+| `lazydocker` | [lazydocker](https://github.com/jesseduffield/lazydocker), a terminal UI for Docker: containers, logs, stats, restart/remove. Needs the `docker` module; run it with `sudo lazydocker` (or as a user in the `docker` group) |
 | `neovim` | Latest [Neovim](https://github.com/neovim/neovim) in `/opt/nvim` (apt's version is too old for LazyVim) |
 | `lazyvim` | [LazyVim](https://www.lazyvim.org) starter config in `~/.config/nvim` for `ADMIN_USER`, plugins pre-installed. Also adds Neovim, tree-sitter CLI, a C compiler, ripgrep, fd and fzf. **An existing `~/.config/nvim` is never overwritten.** Use a [Nerd Font](https://www.nerdfonts.com) in *your* terminal app to see icons |
 | `herdr` | [herdr](https://github.com/herdrdev/herdr), a terminal multiplexer for coding agents. Sessions keep running after you disconnect, and you reattach over SSH. Start it with `herdr` |
@@ -393,7 +454,7 @@ All variables are in `config/default.env`. The main ones:
 | `EXTRA_PACKAGES` | empty | Space-separated extra apt packages |
 | `CLI_TOOLS` | 19 tools | apt package names for `cli-tools` |
 | `CLI_SHELL_INTEGRATION` | `yes` | `ll`/`lt` aliases, `z`, fzf key bindings |
-| `DEV_TOOLS` | `git lazygit neovim lazyvim herdr` | Items for `dev-tools` |
+| `DEV_TOOLS` | `git lazygit neovim` | Items for `dev-tools` |
 | `GIT_USER_NAME` / `GIT_USER_EMAIL` | empty | git identity for `ADMIN_USER` |
 | `TAILSCALE_AUTHKEY` | empty | `tskey-auth-…` to join automatically. **Secret**: pass it at run time, don't commit it |
 | `TAILSCALE_HOSTNAME` | empty | Name in your tailnet (default: system hostname) |
@@ -421,10 +482,13 @@ All variables are in `config/default.env`. The main ones:
 - effective sshd settings (root login, password login, X11)
 - extra UID-0 accounts and accounts with empty passwords
 - UFW status and rules, fail2ban status and current bans
-- every port listening on a non-localhost address, with the process name
-- Docker containers publishing ports on `0.0.0.0` (these bypass UFW)
+- every port listening on a non-localhost address, with the process name, and rpcbind (port 111) exposed
+- Docker containers publishing ports that UFW doesn't allow (Docker bypasses UFW). Ports UFW allows anyway, like 80/443 on a reverse proxy, are fine.
 - nginx version hiding
+- whether Tailscale is connected
 - whether IMDSv2 is enforced (on EC2)
+
+Every problem that can be fixed automatically comes with a fix. Apply it from **Audit & fix** in `./ops` with Enter, or by hand with the `sudo checks/fix.sh …` command printed under it. See [Audit & fix](#audit--fix).
 
 It runs automatically at the end of `bootstrap.sh`. Run it any time:
 
