@@ -178,11 +178,17 @@ tui/build.sh          # builds bin/ops-linux-amd64 and bin/ops-linux-arm64 (need
 
 `tools/push-and-run.sh` copies `bin/` to the server too, so building on your laptop before pushing is enough.
 
-To publish binaries for `./ops` to download, push a version tag. The GitHub Actions workflow (`.github/workflows/release.yml`) builds both architectures and attaches them with `checksums.txt`:
+**Releases are automatic.** Every push to `main` that changes `tui/` runs `.github/workflows/release.yml`. It builds both architectures and publishes a GitHub release with `checksums.txt`, and `./ops` on a server downloads from the latest one. The version is the last tag with the patch number bumped: the first is `v0.1.0`, then `v0.1.1`, `v0.1.2`, and so on.
 
-```bash
-git tag v0.1.0 && git push origin v0.1.0
-```
+- Pushes that only change scripts or docs don't make a release. The binary runs the scripts from your clone, so it doesn't need rebuilding.
+- **Minor or major version:** put `#minor` or `#major` anywhere in a commit message, e.g. `git commit -m "Add backup module #minor"`. Any commit since the last release counts, and `#major` wins over `#minor`.
+
+  | Last release | No marker | `#minor` | `#major` |
+  |---|---|---|---|
+  | `v0.1.4` | `v0.1.5` | `v0.2.0` | `v1.0.0` |
+
+  You can also push a tag yourself (`git tag v0.2.0 && git push origin v0.2.0`). Later automatic releases continue from it.
+- **Release without a code change:** in GitHub, go to **Actions → release → Run workflow**.
 
 The UI uses Charm's [Bubble Tea](https://github.com/charmbracelet/bubbletea), [huh](https://github.com/charmbracelet/huh) and [Lip Gloss](https://github.com/charmbracelet/lipgloss). Each screen is one file in `tui/`: `audit.go`, `setup.go`, `run.go`, `pages.go`. To add a check with a fix, add a `check` line in `checks/audit.sh` and a case in `checks/fix.sh`. The UI picks it up automatically.
 
