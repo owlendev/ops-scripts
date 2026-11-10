@@ -1,6 +1,6 @@
 # ops-scripts
 
-Prepare fresh Ubuntu/Debian servers (mainly AWS EC2) for client work: updated, hardened, with SSH/HTTP/HTTPS open and nothing else.
+Prepare fresh Ubuntu/Debian servers (AWS EC2, Oracle Cloud or any VPS) for client work: updated, hardened, with SSH/HTTP/HTTPS open and nothing else.
 
 This repo is only for **preparing** a server. Deploying the client's application is a separate step/repo.
 
@@ -11,25 +11,30 @@ fresh server ──► ./ops (terminal UI) ─┐
                                               Tailscale, nginx/HTTPS, Docker, AWS CLI)
 ```
 
-There are two ways to drive it, and they use the same bash modules:
+**The terminal UI is the default way to use it:**
 
-- **`sudo ./ops`**: a terminal UI. Use it when you're on the server doing things by hand. It has a guided setup with checklists, live progress, and **Audit & fix**: it finds problems and fixes each one when you press Enter.
-- **`sudo ./bootstrap.sh [-c config.env]`**: no questions asked. Use it for repeatable setups, scripts and (later) Terraform.
+```bash
+sudo ./ops
+```
 
-The UI can save your choices as a config file, so you can reuse them with `bootstrap.sh` next time. All the logic lives in the bash scripts. The UI (written in Go, in `tui/`) only shows them and runs them.
+It gives you a guided setup with checklists, live progress, and **Audit & fix**, which finds problems and fixes each one when you press Enter. `sudo ./bootstrap.sh` and `tools/push-and-run.sh user@host` open the same UI when you give them no options.
+
+For repeatable setups, scripts and (later) Terraform, the same modules also run **unattended**: give `bootstrap.sh` a config file (`-c client.env`) or any option, and it asks nothing. The UI can save your choices as that config file. All the logic lives in the bash scripts. The UI (written in Go, in `tui/`) only shows them and runs them.
 
 ---
 
 ## Contents
 
-- [Layout](#layout)
+- [Getting started](#getting-started)
 - [The ops terminal UI](#the-ops-terminal-ui)
   - [Audit & fix](#audit--fix)
+  - [How ./ops gets the UI](#how-ops-gets-the-ui)
   - [Building and releases](#building-and-releases)
-- [Quick start](#quick-start)
-  - [A. Launch + prepare a new EC2 instance in one command](#a-launch--prepare-a-new-ec2-instance-in-one-command)
-  - [B. Prepare an existing server from your machine](#b-prepare-an-existing-server-from-your-machine)
-  - [C. Run directly on the server](#c-run-directly-on-the-server)
+- [Layout](#layout)
+- [Other ways to run it](#other-ways-to-run-it)
+  - [A. From your laptop over SSH](#a-from-your-laptop-over-ssh)
+  - [B. Unattended, with a config file](#b-unattended-with-a-config-file)
+  - [C. Launch + prepare a new EC2 instance in one command](#c-launch--prepare-a-new-ec2-instance-in-one-command)
 - [Client configs](#client-configs)
 - [Modules](#modules)
 - [Tools installed](#tools-installed)
@@ -45,61 +50,40 @@ The UI can save your choices as a config file, so you can reuse them with `boots
 
 ---
 
-## Layout
+## Getting started
 
-```
-ops-scripts/
-├── ops                     # Starts the terminal UI (run ON the server: sudo ./ops)
-├── bootstrap.sh            # Non-interactive: runs the enabled modules in order (run ON the server)
-├── setup.sh                # Fallback menu (whiptail) for when the ops binary isn't available
-├── tui/                    # Source of the ops terminal UI (Go)
-├── bin/                    # Built ops binaries (git-ignored; tui/build.sh or GitHub releases)
-├── config/
-│   └── default.env         # All settings and their defaults
-├── lib/
-│   └── common.sh           # Shared helpers (logging, apt, config loading)
-├── modules/                # One job per script, run in numeric order, safe to re-run
-│   ├── 10-system-update.sh
-│   ├── 20-base-tools.sh
-│   ├── 22-cli-tools.sh     # ripgrep, fd, fzf, bat, eza, btop...
-│   ├── 25-swap.sh
-│   ├── 30-firewall.sh
-│   ├── 40-ssh-hardening.sh
-│   ├── 45-fail2ban.sh
-│   ├── 50-auto-updates.sh
-│   ├── 55-kernel-hardening.sh
-│   ├── 60-dev-tools.sh     # optional: git setup, lazygit, lazydocker, Neovim, LazyVim, herdr
-│   ├── 65-tailscale.sh     # optional: private VPN access, Tailscale SSH
-│   ├── 70-docker.sh        # optional
-│   ├── 75-aws-cli.sh       # optional
-│   └── 80-nginx.sh         # optional (+ certbot / HTTPS)
-├── checks/
-│   ├── audit.sh            # Read-only security/health report (--json for the UI)
-│   └── fix.sh              # One fix per audit problem (the UI runs these on Enter)
-├── tools/                  # Run FROM YOUR MACHINE, not on the server
-│   ├── ec2-launch.sh       # Security group + instance + bootstrap
-│   ├── ec2-terminate.sh    # Remove everything ec2-launch.sh created
-│   └── push-and-run.sh     # Copy repo to any server over SSH and bootstrap it
-└── examples/               # Starting points for client configs
-    ├── web-server.env
-    ├── docker-host.env
-    └── minimal.env
-```
+**Supported servers:** Ubuntu 22.04 / 24.04 LTS (main target) and Debian 12, on amd64 or arm64. That covers AWS EC2 (including Graviton), Oracle Cloud (including Ampere), Lightsail, DigitalOcean and so on. Tested on Ubuntu 24.04.
 
-**Supported:** Ubuntu 22.04 / 24.04 LTS (main target) and Debian 12. Tested on Ubuntu 24.04.
+**1. Create the server** in your cloud console. Open these ports in the cloud firewall (the AWS security group or OCI security list): **22** from your IP only, and **80/443** if it will serve a website. Then download its SSH key. See [EC2 key pairs](#ec2-key-pairs) if you need a key.
 
----
-
-## The ops terminal UI
-
-The easiest way to prepare a server by hand: create the instance in your cloud console, SSH in, and run:
+**2. SSH in** as the default user. That's `ubuntu` on Ubuntu images (AWS and Oracle Cloud alike) and `admin` on Debian:
 
 ```bash
+ssh -i ~/.ssh/client.pem ubuntu@203.0.113.10
+```
+
+**3. Get the repo and start the UI:**
+
+```bash
+sudo apt-get install -y git        # if git is missing
 git clone https://github.com/owlendev/ops-scripts.git && cd ops-scripts
 sudo ./ops
 ```
 
-`./ops` picks the binary for your CPU (amd64 or arm64) from `bin/`. If it isn't there yet, it builds it (when Go is installed) or downloads it from the [latest GitHub release](https://github.com/owlendev/ops-scripts/releases) and verifies its SHA-256 checksum. The binary is a single static file with nothing to install.
+The first start downloads the UI (about 5 MB, [checksum-verified](#how-ops-gets-the-ui)). After that it starts instantly.
+
+**4. In the UI:**
+
+1. **Guided setup**: the defaults are already ticked (updates, firewall, SSH keys only, fail2ban, auto updates…). Tick extras like Docker, nginx, Tailscale or dev tools, check the settings, then **Run**. Save the choices as a config file if you'll want the same setup again.
+2. **Audit & fix**: confirm everything is green. Press Enter on anything that isn't.
+
+> **Keep your SSH session open** while SSH hardening runs, and test a **new** login in a second terminal before you close it. The module protects you from lockouts (it refuses to disable passwords if no SSH key is installed), but a second window is the safety net.
+
+**Later:** `cd ops-scripts && git pull && sudo ./ops`. The pull updates the scripts. The UI binary stays as it is until you delete `bin/`, and then `./ops` fetches the latest release.
+
+---
+
+## The ops terminal UI
 
 ```
  ops  web1                                        Ubuntu 24.04 LTS · 10.0.0.13 · arm64
@@ -128,12 +112,23 @@ sudo ./ops
 
 While modules or fixes run you see live output and a ✓/✗ per module. Scroll with the arrow keys or PgUp/PgDn, and press **Ctrl-C** to cancel.
 
-Other ways to start it:
+| Key | Where | Does |
+|---|---|---|
+| ↑/↓, Enter | everywhere | move, choose |
+| Esc | everywhere | back |
+| Space / x | checklists | tick or untick |
+| a / p / r | Audit & fix | fix all safe / problems only / re-scan |
+| c | Generate a secret | copy to your clipboard |
+| Ctrl-C | while running | cancel |
+| q | home | quit |
+
+Ways to start it (they all open the same UI):
 
 ```bash
+sudo ./ops                               # the main command
 sudo ./ops -c clients/acme.env           # start from a client config (its choices pre-ticked)
-tools/push-and-run.sh -i key.pem ubuntu@host -- --interactive   # copy repo + open the whiptail menu remotely
-sudo ./setup.sh                          # fallback whiptail menu, no binary needed
+sudo ./bootstrap.sh                      # no options = UI
+tools/push-and-run.sh -i key.pem ubuntu@host      # from your laptop: copy the repo, open the UI there
 ```
 
 ### Audit & fix
@@ -170,6 +165,19 @@ sudo checks/fix.sh docker-allow 443/udp
 
 The plain `checks/audit.sh` report prints the matching `fix:` command under every problem.
 
+### How ./ops gets the UI
+
+The UI is one static binary per CPU, `bin/ops-linux-amd64` or `bin/ops-linux-arm64`, with nothing to install. `bin/` is git-ignored, so on a fresh clone `./ops` gets the binary like this:
+
+1. **Already in `bin/`**: it uses it. `tools/push-and-run.sh` copies your laptop's `bin/` along, so binaries you built there are used as they are.
+2. **Go installed**: it builds the binary from `tui/`.
+3. **Otherwise**: it downloads the binary from the [latest GitHub release](https://github.com/owlendev/ops-scripts/releases) and checks it against the release's `checksums.txt`. If the checksum doesn't match, the binary isn't installed.
+4. **None of that works** (no internet, an unusual CPU): it opens `setup.sh` instead. That's a simpler whiptail menu with the same modules and settings, and it needs nothing extra.
+
+To update the UI, delete `bin/` and run `./ops` again.
+
+Using your own fork? Point the download at it: `sudo OPS_RELEASE_REPO=you/ops-scripts ./ops`.
+
 ### Building and releases
 
 ```bash
@@ -194,9 +202,88 @@ The UI uses Charm's [Bubble Tea](https://github.com/charmbracelet/bubbletea), [h
 
 ---
 
-## Quick start
+## Layout
 
-### A. Launch + prepare a new EC2 instance in one command
+```
+ops-scripts/
+├── ops                     # START HERE: the terminal UI (run ON the server: sudo ./ops)
+├── bootstrap.sh            # Unattended runner: the enabled modules in order (no options = opens the UI)
+├── setup.sh                # Fallback menu (whiptail); ./ops opens it when the UI binary can't be had
+├── tui/                    # Source of the ops terminal UI (Go)
+├── bin/                    # Built ops binaries (git-ignored; tui/build.sh or GitHub releases)
+├── config/
+│   └── default.env         # All settings and their defaults
+├── lib/
+│   └── common.sh           # Shared helpers (logging, apt, config loading)
+├── modules/                # One job per script, run in numeric order, safe to re-run
+│   ├── 10-system-update.sh
+│   ├── 20-base-tools.sh
+│   ├── 22-cli-tools.sh     # ripgrep, fd, fzf, bat, eza, btop...
+│   ├── 25-swap.sh
+│   ├── 30-firewall.sh
+│   ├── 40-ssh-hardening.sh
+│   ├── 45-fail2ban.sh
+│   ├── 50-auto-updates.sh
+│   ├── 55-kernel-hardening.sh
+│   ├── 60-dev-tools.sh     # optional: git setup, lazygit, lazydocker, Neovim, LazyVim, herdr
+│   ├── 65-tailscale.sh     # optional: private VPN access, Tailscale SSH
+│   ├── 70-docker.sh        # optional
+│   ├── 75-aws-cli.sh       # optional
+│   └── 80-nginx.sh         # optional (+ certbot / HTTPS)
+├── checks/
+│   ├── audit.sh            # Read-only security/health report (--json for the UI)
+│   └── fix.sh              # One fix per audit problem (the UI runs these on Enter)
+├── tools/                  # Run FROM YOUR MACHINE, not on the server
+│   ├── ec2-launch.sh       # Security group + instance + bootstrap
+│   ├── ec2-terminate.sh    # Remove everything ec2-launch.sh created
+│   └── push-and-run.sh     # Copy repo to any server over SSH, open the UI (or bootstrap with -c)
+└── examples/               # Starting points for client configs
+    ├── web-server.env
+    ├── docker-host.env
+    └── minimal.env
+```
+
+---
+
+## Other ways to run it
+
+[Getting started](#getting-started) (SSH in, `sudo ./ops`) covers most cases. These are for when you'd rather not clone on the server, or want no questions asked.
+
+### A. From your laptop over SSH
+
+This works for any server you can reach over SSH. It copies the repo (including the `bin/` you built locally) to `/opt/ops-scripts` and opens the UI there:
+
+```bash
+tools/push-and-run.sh -i ~/.ssh/acme.pem ubuntu@203.0.113.10
+```
+
+Add a client config to run it **unattended** instead, or add `-u` to open the UI with that config pre-filled:
+
+```bash
+tools/push-and-run.sh -i ~/.ssh/acme.pem -c clients/acme.env ubuntu@203.0.113.10      # unattended
+tools/push-and-run.sh -i ~/.ssh/acme.pem -c clients/acme.env -u ubuntu@203.0.113.10   # UI, pre-filled
+tools/push-and-run.sh -i key.pem ubuntu@host -- --only nginx                          # options for bootstrap.sh
+```
+
+### B. Unattended, with a config file
+
+On the server, any option makes `bootstrap.sh` run without the UI:
+
+```bash
+sudo ./bootstrap.sh -c clients/acme.env            # run all modules enabled in the config
+sudo ./bootstrap.sh --yes                          # run the defaults, no config, no UI
+sudo ./bootstrap.sh --list                         # show modules and whether they're enabled
+sudo ./bootstrap.sh --only firewall,ssh-hardening  # run just these (ignores ENABLE_* flags)
+sudo ./bootstrap.sh --skip swap                    # run enabled modules except these
+sudo ./modules/80-nginx.sh                         # run one module by itself
+sudo SSH_PORT=2222 ./bootstrap.sh --only ssh-hardening   # override a setting from the environment
+```
+
+When it isn't run from a terminal (cron, cloud-init, CI), `bootstrap.sh` never opens the UI, even with no options.
+
+Everything is logged to `/var/log/ops-bootstrap.log`.
+
+### C. Launch + prepare a new EC2 instance in one command
 
 Requirements on your machine: [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) configured (`aws configure` or `AWS_PROFILE`), and an EC2 key pair with its `.pem` file.
 
@@ -222,45 +309,10 @@ This will:
 1. Create a security group `acme-web-sg`: SSH only from **your current IP**, HTTP/HTTPS from anywhere.
 2. Launch the latest official Ubuntu 24.04 AMI, with an encrypted gp3 disk and IMDSv2 required.
 3. (`--eip`) Attach an Elastic IP so the IP doesn't change on stop/start. You need this for DNS.
-4. Wait for SSH and for cloud-init to finish, then run `bootstrap.sh` with your config. You'll see the output live.
+4. Wait for SSH and for cloud-init to finish, then run `bootstrap.sh` with your config. You'll see the output live. Without `--config`, it opens the UI on the new instance instead.
 5. Print the SSH command and the destroy command.
 
 Use `--no-bootstrap` to only launch. Run `tools/ec2-launch.sh --help` for all options.
-
-### B. Prepare an existing server from your machine
-
-Use this for any server you can reach over SSH: an EC2 instance launched from the console, a Lightsail box, a DigitalOcean droplet, and so on.
-
-```bash
-tools/push-and-run.sh -i ~/.ssh/acme.pem -c clients/acme.env ubuntu@203.0.113.10
-```
-
-It copies the repo to `/opt/ops-scripts` on the server and runs `sudo bootstrap.sh` there. Anything after `--` is passed to `bootstrap.sh`:
-
-```bash
-tools/push-and-run.sh -i key.pem ubuntu@host -- --only nginx
-```
-
-### C. Run directly on the server
-
-```bash
-git clone <this-repo> /opt/ops-scripts     # or scp it
-cd /opt/ops-scripts
-sudo ./bootstrap.sh -c /path/to/client.env
-```
-
-Options:
-
-```bash
-sudo ./bootstrap.sh --list                         # show modules and whether they're enabled
-sudo ./bootstrap.sh -c client.env                  # run all enabled modules
-sudo ./bootstrap.sh --only firewall,ssh-hardening  # run just these (ignores ENABLE_* flags)
-sudo ./bootstrap.sh --skip swap                    # run enabled modules except these
-sudo ./modules/80-nginx.sh                         # run one module by itself
-sudo SSH_PORT=2222 ./bootstrap.sh --only ssh-hardening   # override a setting from the environment
-```
-
-Everything is logged to `/var/log/ops-bootstrap.log`.
 
 ---
 
@@ -686,7 +738,7 @@ If a secret leaks (committed to git, pasted in chat, sent by email), **rotate it
 
    ```bash
    #!/usr/bin/env bash
-   # Short summary, max ~60 chars (shown in the setup.sh checklist).
+   # Short summary, max ~60 chars (shown in the UI and setup.sh checklists).
    # More detail on the following lines if needed.
    set -euo pipefail
    # shellcheck source=../lib/common.sh

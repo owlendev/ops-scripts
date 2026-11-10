@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Starts the ops terminal UI (tui/). Uses bin/ops-linux-<arch>; if it's missing,
-# builds it (when Go is installed) or downloads it from the GitHub release and
-# verifies its checksum.
+# Starts the ops terminal UI (tui/), the main way to use this repo. Uses
+# bin/ops-linux-<arch>; if it's missing, builds it (when Go is installed) or
+# downloads it from the latest GitHub release and verifies its checksum.
+# If neither works, falls back to the simpler whiptail menu (setup.sh).
 #
 #   sudo ./ops [-c client.env]
 set -euo pipefail
@@ -12,26 +13,39 @@ REPO="${OPS_RELEASE_REPO:-owlendev/ops-scripts}"
 case "$(uname -m)" in
   x86_64)        ARCH=amd64 ;;
   aarch64|arm64) ARCH=arm64 ;;
-  *) echo "ops: unsupported CPU $(uname -m). Use ./setup.sh instead." >&2; exit 1 ;;
+  *) ARCH="" ;;
 esac
 BIN="$ROOT/bin/ops-linux-$ARCH"
 
+fallback() {
+  echo "ops: $1" >&2
+  echo "ops: opening the simpler menu (setup.sh) instead." >&2
+  sleep 2
+  if [[ "$(id -u)" -ne 0 ]]; then exec sudo bash "$ROOT/setup.sh" "$@"; fi
+  exec bash "$ROOT/setup.sh" "$@"
+}
+
+download() {
+  local base="https://github.com/$REPO/releases/latest/download"
+  tmp="$(mktemp -d)" # global: the EXIT trap still needs it
+  trap 'rm -rf "$tmp"' EXIT
+  echo "Downloading the ops UI for $ARCH from github.com/$REPO releases..."
+  curl -fsSL "$base/ops-linux-$ARCH" -o "$tmp/ops-linux-$ARCH" &&
+    curl -fsSL "$base/checksums.txt" -o "$tmp/checksums.txt" || return 1
+  (cd "$tmp" && grep " ops-linux-$ARCH\$" checksums.txt | sha256sum -c --quiet -) ||
+    { echo "ops: checksum mismatch, not installing." >&2; return 1; }
+  install -m 0755 "$tmp/ops-linux-$ARCH" "$BIN"
+}
+
+[[ -n "$ARCH" ]] || fallback "no prebuilt UI for CPU $(uname -m)" "$@"
 if [[ ! -x "$BIN" ]]; then
   mkdir -p "$ROOT/bin"
   if command -v go >/dev/null; then
-    echo "Building ops for $ARCH..."
-    (cd "$ROOT/tui" && CGO_ENABLED=0 go build -ldflags "-s -w" -o "$BIN" .)
+    echo "Building the ops UI for $ARCH..."
+    (cd "$ROOT/tui" && CGO_ENABLED=0 go build -ldflags "-s -w" -o "$BIN" .) ||
+      fallback "build failed" "$@"
   else
-    echo "Downloading ops for $ARCH from github.com/$REPO releases..."
-    base="https://github.com/$REPO/releases/latest/download"
-    tmp="$(mktemp -d)"
-    trap 'rm -rf "$tmp"' EXIT
-    curl -fsSL "$base/ops-linux-$ARCH" -o "$tmp/ops-linux-$ARCH" \
-      && curl -fsSL "$base/checksums.txt" -o "$tmp/checksums.txt" \
-      || { echo "ops: download failed. Build it with Go, or use ./setup.sh." >&2; exit 1; }
-    (cd "$tmp" && grep " ops-linux-$ARCH\$" checksums.txt | sha256sum -c --quiet -) \
-      || { echo "ops: checksum mismatch, not installing." >&2; exit 1; }
-    install -m 0755 "$tmp/ops-linux-$ARCH" "$BIN"
+    download || fallback "couldn't download the UI (no release yet, or no internet)" "$@"
   fi
 fi
 

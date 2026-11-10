@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Interactive menu for ops-scripts: pick modules, tools and settings from
-# checklists, then run them. Uses the same modules and config as bootstrap.sh.
+# Fallback menu (whiptail) for ops-scripts: pick modules, tools and settings from
+# checklists, then run them. The main UI is ./ops; it opens this one by itself
+# when the UI binary can't be built or downloaded.
 set -euo pipefail
 
 OPS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

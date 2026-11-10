@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Prepare a fresh Ubuntu/Debian server by running the enabled modules in modules/.
-# Safe to re-run.
+# Safe to re-run. This is the unattended runner; with no options in a terminal it
+# opens the terminal UI (./ops) instead. Use --yes to run the defaults unattended.
 set -euo pipefail
 
 OPS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,15 +13,20 @@ usage() {
   cat <<EOF
 Usage: sudo $0 [options]
 
+With no options in a terminal, this opens the terminal UI (same as ./ops).
+Any option below runs unattended instead.
+
 Options:
+  -y, --yes            Run the enabled modules with the default settings, no UI
   -c, --config FILE    Client config file (overrides config/default.env)
   -o, --only LIST      Run only these modules, comma separated (ignores ENABLE_* flags)
   -s, --skip LIST      Skip these modules, comma separated
   -l, --list           List modules and whether they are enabled, then exit
-  -i, --interactive    Open the interactive menu (same as ./setup.sh)
+  -i, --interactive    Open the terminal UI (same as ./ops)
   -h, --help           Show this help
 
 Examples:
+  sudo $0                                   # terminal UI
   sudo $0 -c examples/web-server.env
   sudo $0 --only firewall,ssh-hardening
   sudo $0 --skip swap
@@ -31,6 +37,8 @@ ONLY=""
 SKIP=""
 LIST=0
 INTERACTIVE=0
+# No options at all in a terminal: open the UI.
+if [[ $# -eq 0 && -t 0 && -t 1 ]]; then INTERACTIVE=1; fi
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -c|--config) [[ -n "${2:-}" ]] || die "--config needs a file"
@@ -39,6 +47,7 @@ while [[ $# -gt 0 ]]; do
     -o|--only)   ONLY="${2:-}"; shift 2 ;;
     -s|--skip)   SKIP="${2:-}"; shift 2 ;;
     -l|--list)   LIST=1; shift ;;
+    -y|--yes)    shift ;;
     -i|--interactive) INTERACTIVE=1; shift ;;
     -h|--help)   usage; exit 0 ;;
     *)           usage >&2; die "Unknown option: $1" ;;
@@ -46,7 +55,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if (( INTERACTIVE )); then
-  exec "$OPS_ROOT/setup.sh" ${OPS_CONFIG:+-c "$OPS_CONFIG"}
+  exec "$OPS_ROOT/ops" ${OPS_CONFIG:+-c "$OPS_CONFIG"}
 fi
 
 load_config
