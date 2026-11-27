@@ -1,0 +1,36 @@
+# The shared front door: the ONLY container that publishes ports on this VM.
+# Managed by ops-scripts (modules/85-app-proxy.sh); add apps with `ops-app`, not here.
+name: proxy
+
+services:
+  caddy:
+    image: ${CADDY_IMAGE:-caddy:2.11.6}
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"     # HTTP/3
+    env_file: .env        # APPS_DOMAIN, PROXY_ALLOW_FROM, CF_API_TOKEN...
+    volumes:
+      - ./conf:/etc/caddy:ro            # Caddyfile + sites/*.caddy (one per app)
+      - ./public:/srv/public:ro         # root.crt download page
+      - caddy-data:/data                # certificates and Caddy's own CA: back this up
+      - caddy-config:/config
+    networks: [proxy]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  caddy-data:
+  caddy-config:
+
+networks:
+  proxy:
+    external: true

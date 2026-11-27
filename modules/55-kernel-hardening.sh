@@ -49,5 +49,18 @@ then
   info "Wrote $CONF"
 fi
 
+if in_container; then
+  # The Proxmox host owns kernel.* and fs.*; a container may only change its own
+  # network settings. Apply what we can, one by one.
+  skipped=0
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[a-z] ]] || continue
+    sysctl -q -w "${line// /}" >/dev/null 2>&1 || skipped=$((skipped + 1))
+  done < "$CONF"
+  ok "Network hardening applied (in a container)"
+  (( skipped )) && info "$skipped kernel-wide settings are controlled by the Proxmox host; skipped here"
+  exit 0
+fi
+
 sysctl -q -p "$CONF"
 ok "Kernel hardening applied"

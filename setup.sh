@@ -124,10 +124,17 @@ TAILSCALE_AUTHKEY|Auth key|tskey-auth-... from the Tailscale admin console > Set
 TAILSCALE_HOSTNAME|Tailnet name|Name in your tailnet, e.g. acme-web. Empty = system hostname.|tailscale
 TAILSCALE_SSH|Tailscale SSH|yes = SSH over Tailscale with your tailnet identity (no keys needed).|tailscale
 TAILSCALE_SSH_ONLY|SSH only via TS|yes = close public SSH once Tailscale is connected. Test Tailscale SSH works first!|tailscale
+TAILSCALE_ADVERTISE_ROUTES|Share LAN IPs|Subnet router: LAN addresses tailnet devices may reach through this machine, e.g. 192.168.1.50/32 192.168.1.2/32. Empty = none.|tailscale
+APPS_DOMAIN|Apps domain|Apps get https://<name>.<this>, e.g. home.internal.|app-proxy
+PROXY_TLS|Certificates|internal = Caddy's own CA (trust once per device), cloudflare = real certificates (needs a domain on Cloudflare).|app-proxy
+PROXY_CF_API_TOKEN|Cloudflare token|Only for cloudflare: API token with Zone.DNS edit. Never written to saved config files.|app-proxy
+PROXY_ACME_EMAIL|LE email|Only for cloudflare: Let's Encrypt expiry notices.|app-proxy
+ADGUARD_REWRITES|Local names|Space separated name=ip, e.g. *.home.internal=192.168.1.50 (the apps VM).|adguard
+ADGUARD_PASSWORD|AdGuard password|Empty = generated and saved to /root/adguard-admin.txt. Never written to saved config files.|adguard
 REBOOT_IF_REQUIRED|Reboot at end|yes = reboot after setup if updates need it.|"
 
 # Settings that are secrets: masked on screen and never written to saved files.
-SECRET_SETTINGS=" TAILSCALE_AUTHKEY "
+SECRET_SETTINGS=" TAILSCALE_AUTHKEY PROXY_CF_API_TOKEN ADGUARD_PASSWORD "
 is_secret() { [[ "$SECRET_SETTINGS" == *" $1 "* ]]; }
 show_value() { # key
   if is_secret "$1"; then [[ -n "${!1}" ]] && echo "(set)" || echo "(empty)"

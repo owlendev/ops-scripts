@@ -116,13 +116,21 @@ type home struct {
 }
 
 func newHome(a *app) *home {
-	return &home{app: a, items: []menuItem{
-		{"setup", "Guided setup", "Pick modules, tools and settings, then run them"},
+	var items []menuItem
+	setupDesc := "Pick modules, tools and settings, then run them"
+	if isProxmox() {
+		items = append(items,
+			menuItem{"pve-new", "New machine", "Create an LXC or VM on this Proxmox from a recipe (AdGuard, apps VM...) and set it up"},
+			menuItem{"pve-list", "Machines", "What ops made on this Proxmox, and how to log in to each"})
+		setupDesc = "Set up THIS Proxmox host itself (for new LXCs/VMs use New machine)"
+	}
+	return &home{app: a, items: append(items, []menuItem{
+		{"setup", "Guided setup", setupDesc},
 		{"audit", "Audit & fix", "Check security and health, then fix problems with Enter"},
 		{"module", "Run a module", "Run a single module on its own"},
 		{"secret", "Generate a secret", "App secrets, database passwords, SSH key help"},
 		{"quit", "Quit", ""},
-	}}
+	}...)}
 }
 
 func (p *home) Init() tea.Cmd    { return nil }
@@ -164,6 +172,14 @@ func (p *home) open(key string) tea.Cmd {
 		return push(mp)
 	case "secret":
 		return push(newSecrets())
+	case "pve-new":
+		pp, err := newPveRecipes(r)
+		if err != nil {
+			return push(newMessage("New machine", err.Error()))
+		}
+		return push(pp)
+	case "pve-list":
+		return push(newPveMachines(r))
 	}
 	return tea.Quit
 }

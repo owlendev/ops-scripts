@@ -51,6 +51,13 @@ for rule in $FIREWALL_EXTRA_PORTS; do
   ufw allow "$rule" >/dev/null && info "$rule allowed"
 done
 
-ufw --force enable >/dev/null
+if ! out="$(ufw --force enable 2>&1)"; then
+  if in_container; then
+    warn "UFW can't run in this container: $(tail -1 <<< "$out")"
+    hint "Use the Proxmox firewall instead: Proxmox → this CT → Firewall → Options → Firewall: Yes, then add rules (e.g. allow 22, 53, 80). Or set ENABLE_FIREWALL=no for this machine."
+    exit 3
+  fi
+  die_fix "UFW failed to start: $(tail -1 <<< "$out")" "Check the kernel has netfilter support: sudo iptables -L; then re-run the firewall module"
+fi
 ok "UFW active"
 ufw status verbose | sed 's/^/    /'

@@ -15,7 +15,13 @@ apt_get clean
 ok "System packages are up to date"
 
 if [[ "$(timedatectl show -p Timezone --value 2>/dev/null)" != "$TIMEZONE" ]]; then
-  timedatectl set-timezone "$TIMEZONE"
+  [[ -f "/usr/share/zoneinfo/$TIMEZONE" ]] ||
+    die_fix "Unknown timezone '$TIMEZONE'" "Use a name like UTC or Asia/Riyadh (list: timedatectl list-timezones)"
+  if ! timedatectl set-timezone "$TIMEZONE" 2>/dev/null; then
+    # Containers often can't use timedatectl; set it the classic way.
+    ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+    echo "$TIMEZONE" > /etc/timezone
+  fi
   ok "Timezone set to $TIMEZONE"
 else
   ok "Timezone already $TIMEZONE"
@@ -25,7 +31,8 @@ fi
 timedatectl set-ntp true 2>/dev/null || true
 
 if [[ -n "$HOSTNAME_FQDN" && "$(hostname -f 2>/dev/null)" != "$HOSTNAME_FQDN" ]]; then
-  hostnamectl set-hostname "$HOSTNAME_FQDN"
+  hostnamectl set-hostname "$HOSTNAME_FQDN" 2>/dev/null ||
+    { echo "$HOSTNAME_FQDN" > /etc/hostname; hostname "$HOSTNAME_FQDN"; }
   short="${HOSTNAME_FQDN%%.*}"
   if ! grep -qE "^127\.0\.1\.1\s+$HOSTNAME_FQDN" /etc/hosts; then
     sed -i '/^127\.0\.1\.1\s/d' /etc/hosts

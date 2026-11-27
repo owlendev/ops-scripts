@@ -6,6 +6,11 @@ set -euo pipefail
 . "$(dirname "$0")/../lib/common.sh"
 require_root; require_supported_os; load_config
 
+if in_container; then
+  ok "In a container: memory and swap are set on the Proxmox host (CT → Resources), not here"
+  exit 0
+fi
+
 if swapon --show --noheadings | grep -q .; then
   ok "Swap already active: $(swapon --show --noheadings | awk '{print $1" "$3}' | tr '\n' ' ')"
   exit 0

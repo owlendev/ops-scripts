@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Trust your home apps</title>
+<style>body{font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:2rem auto;padding:0 1rem}a.b{display:inline-block;padding:.7rem 1.2rem;background:#2563eb;color:#fff;border-radius:.5rem;text-decoration:none}code{background:#8882;padding:0 .3em;border-radius:.2em}</style>
+</head><body>
+<h1>Trust your home apps</h1>
+<p>Install this certificate once on this device, and every <code>https://*.__DOMAIN__</code> app shows a padlock.</p>
+<p><a class="b" href="/root.crt" download="home-apps-root.crt">Download the certificate</a></p>
+<p>SHA-256 fingerprint, to compare with <code>ops-app ca</code> on the server:<br><code>__FP__</code></p>
+<ul>
+<li><b>iPhone/iPad</b>: open this page in Safari, download, then Settings → Profile Downloaded → Install. Then Settings → General → About → Certificate Trust Settings → turn it on.</li>
+<li><b>Android</b>: Settings → Security → Encryption &amp; credentials → Install a certificate → CA certificate.</li>
+<li><b>macOS</b>: open the file → Keychain Access → double-click it → Trust → Always Trust.</li>
+<li><b>Windows</b>: double-click → Install Certificate → Local Machine → Trusted Root Certification Authorities.</li>
+<li><b>Linux</b>: <code>sudo trust anchor --store home-apps-root.crt</code> (Arch), or copy to <code>/usr/local/share/ca-certificates/</code> and run <code>sudo update-ca-certificates</code> (Debian/Ubuntu).</li>
+<li><b>Firefox</b> uses its own list: Settings → Privacy &amp; Security → Certificates → View Certificates → Authorities → Import.</li>
+</ul>
+</body></html>

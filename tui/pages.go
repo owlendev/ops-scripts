@@ -55,7 +55,7 @@ func (p *moduleMenu) Update(msg tea.Msg) (page, tea.Cmd) {
 			if p.repo.Config != "" {
 				args = append(args, "-c", p.repo.Config)
 			}
-			return p, push(newRun("Module: "+m.Name, []step{{Args: args, Env: p.repo.Env()}}, nil))
+			return p, push(newRun("Module: "+m.Name, []step{{Args: args, Env: append(p.repo.Env(), "OPS_UI=1")}}, nil))
 		case "esc", "n":
 			p.confirm = false
 		}
@@ -84,6 +84,10 @@ func (p *moduleMenu) View() string {
 			bar, name = " "+sSelBar.String(), sAcc.Bold(true).Render(name)
 		}
 		b.WriteString(bar + " " + name + " " + sMuted.Render(ansi.Truncate(m.Desc, max(p.w-26, 10), "…")) + "\n")
+	}
+	if m := p.modules[p.cursor]; len(m.Detail) > 0 || m.Desc != "" {
+		text := append([]string{sTitle.Render(m.Name + ": " + m.Desc)}, m.Detail...)
+		b.WriteString("\n  " + strings.ReplaceAll(sBox.Width(max(min(p.w-6, 100), 30)).Render(strings.Join(text, "\n")), "\n", "\n  ") + "\n")
 	}
 	if p.confirm {
 		cfg := "default settings"

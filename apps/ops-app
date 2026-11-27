@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+# ops-app: run Docker apps behind one Caddy, each at https://<name>.<APPS_DOMAIN>.
+# Installed to /usr/local/bin/ops-app by modules/85-app-proxy.sh. Run `ops-app help`.
+#
+# How it works: every app joins the shared Docker network "proxy" under its own name
+# (an alias), and publishes no ports. Caddy is the only container with ports (80/443);
+# it picks the app by the hostname in the request. So apps never fight over ports.
+set -euo pipefail
+
+CONF="${OPS_APP_CONF:-/etc/ops-app.env}"
+[[ -r "$CONF" ]] || { echo "ops-app: $CONF missing. Run the app-proxy module first." >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$CONF"   # APPS_DIR APPS_DOMAIN PROXY_SUBNET TEMPLATES_DIR
+PROXY="$APPS_DIR/_proxy"
+SITES="$PROXY/conf/sites"
+
+if [[ -t 1 ]]; then R=$'\033[31m' G=$'\033[32m' Y=$'\033[33m' B=$'\033[1m' D=$'\033[2m' N=$'\033[0m'
+else R='' G='' Y='' B='' D='' N=''; fi
+ok()   { printf '%sOK%s   %s\n' "$G" "$N" "$*"; }
+warn() { printf '%sWARN%s %s\n' "$Y" "$N" "$*" >&2; }
+bad()  { printf '%sFAIL%s %s\n' "$R" "$N" "$*" >&2; }
+die()  { bad "$*"; exit 1; }
+info() { printf '     %s\n' "$*"; }
+
+usage() {
+  cat <<EOF
+${B}ops-app${N}: apps behind Caddy at https://<name>.$APPS_DOMAIN
+
+${B}Add an app${N}
+  ops-app new <name> --image IMAGE [--port 80]   new app from an image ($APPS_DIR/<name>/)
+  ops-app new <name> --template nextcloud        new app from a ready-made template
+  ops-app adopt <name> --port N [--service S] [--dir DIR]
+                                                 put an existing compose project behind Caddy
+                                                 (e.g. Kontor: ops-app adopt kontor --port 8080)
+  ops-app route <name> <address> [--insecure]    a name for something outside Docker, e.g.
+                                                 ops-app route proxmox https://192.168.1.10:8006 --insecure
+
+${B}Run${N}
+  ops-app up|down|restart|pull|ps|logs <name>    docker compose in the app's folder
+  ops-app list                                   all names, where they go, and if they run
+  ops-app unroute <name>                         remove the name (the app keeps running)
+
+${B}Check${N}
+  ops-app doctor                                 check the proxy, DNS, and every app
+  ops-app ca                                     how to trust the certificates on your devices
+  ops-app reload                                 re-check and reload Caddy's config
+
+Templates: $(ls "$TEMPLATES_DIR" 2>/dev/null | tr '\n' ' ')
+EOF
+}
+
+valid_name() {
+  [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$ ]] || die "Name '$1': use lowercase letters, digits and '-' (e.g. nextcloud, my-app)"
+  case "$1" in ca|_proxy|proxy|www) die "'$1' is reserved; pick another name" ;; esac
+}
+host_of() { echo "$1.$APPS_DOMAIN"; }
+need_docker() { docker info >/dev/null 2>&1 || die "Can't use Docker. Run with sudo, or log in again after being added to the docker group."; }
+caddy_running() { [[ "$(docker inspect -f '{{.State.Running}}' caddy 2>/dev/null)" == true ]]; }
+# This VM's IPv4 addresses (hostname -I is Debian-only).
+vm_ips() { ip -4 -o addr show scope global 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $4 }'; }
+vm_ip() { vm_ips | head -1; }
+gen_secret() { openssl rand -base64 33 | tr -d '/+=\n' | cut -c1-32; }
+
+# docker compose in an app's folder (so its .env, COMPOSE_FILE and profiles apply).
+compose() { (cd "$1" && shift && docker compose "$@"); }
+
+# Validate the whole config with the change in place; on error, undo it.
+apply_config() { # changed_file backup_or_empty
+  local f="$1" bak="${2:-}" out
+  if ! caddy_running; then
+    warn "Caddy isn't running; the change applies when it starts (cd $PROXY && docker compose up -d)"
+    return 0
+  fi
+  if ! out="$(docker exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1)"; then
+    if [[ -n "$bak" ]]; then mv -f "$bak" "$f"; else rm -f "$f"; fi
+    grep -iE 'error|invalid' <<< "$out" | tail -3 >&2
+    die "Caddy rejected the change, so it was undone (nothing else changed)."
+  fi
+  [[ -n "$bak" ]] && rm -f "$bak"
+  docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 ||
+    die "Caddy reload failed: docker logs caddy --tail 30"
+}
+
+write_route() { # name upstream insecure(0|1) extra_file
+  local name="$1" up="$2" insecure="$3" extra="${4:-}" f="$SITES/$1.caddy" bak="" tmp
+  mkdir -p "$SITES"
+  [[ -f "$f" ]] && { bak="$(mktemp "$SITES/.bak.XXXX")"; cp -p "$f" "$bak"; }
+  tmp="$(mktemp "$SITES/.new.XXXX")"
+  {
+    echo "# Managed by ops-app. Remove with: ops-app unroute $name"
+    echo "$(host_of "$name") {"
+    echo "	import secure"
+    [[ -n "$extra" && -f "$extra" ]] && sed 's/^/	/' "$extra"
+    if (( insecure )); then
+      printf '\treverse_proxy %s {\n\t\ttransport http {\n\t\t\ttls_insecure_skip_verify\n\t\t}\n\t}\n' "$up"
+    else
+      printf '\treverse_proxy %s\n' "$up"
+    fi
+    echo "}"
+  } > "$tmp"
+  chmod 0644 "$tmp"; mv -f "$tmp" "$f"
+  apply_config "$f" "$bak"
+  ok "https://$(host_of "$name")  ->  $up"
+}
+
+# The compose.proxy.yml overlay: joins SERVICE to the proxy network as NAME.
+write_overlay() { # dir service name
+  cat > "$1/compose.proxy.yml" <<EOF
+# Written by ops-app: puts '$2' on the shared 'proxy' network, reachable as '$3'.
+# Caddy forwards https://$(host_of "$3") to it. Loaded through COMPOSE_FILE in .env.
+services:
+  $2:
+    networks:
+      default: {}
+      proxy:
+        aliases: [$3]
+
+networks:
+  proxy:
+    external: true
+EOF
+}
+
+# Make COMPOSE_FILE in DIR/.env include compose.proxy.yml.
+link_overlay() { # dir
+  local d="$1" env="$1/.env" cur base f
+  touch "$env"
+  cur="$(grep -E '^COMPOSE_FILE=' "$env" | tail -1 | cut -d= -f2- | tr -d '"'"'" || true)"
+  if [[ -z "$cur" ]]; then
+    for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+      [[ -f "$d/$f" ]] && { base="$f"; break; }
+    done
+    [[ -n "${base:-}" ]] || die "No compose file in $d"
+    cur="$base"
+    for f in compose.override.yaml compose.override.yml docker-compose.override.yaml docker-compose.override.yml; do
+      [[ -f "$d/$f" ]] && cur+=":$f"
+    done
+  fi
+  [[ ":$cur:" == *":compose.proxy.yml:"* ]] && return 0
+  if grep -qE '^COMPOSE_FILE=' "$env"; then
+    sed -i -E "s|^COMPOSE_FILE=.*|COMPOSE_FILE=$cur:compose.proxy.yml|" "$env"
+  else
+    printf '\n# Added by ops-app (compose.proxy.yml = behind Caddy)\nCOMPOSE_FILE=%s:compose.proxy.yml\n' "$cur" >> "$env"
+  fi
+  info "COMPOSE_FILE in $env now includes compose.proxy.yml"
+}
+
+warn_published_ports() { # dir
+  local json
+  command -v jq >/dev/null || return 0
+  json="$(compose "$1" config --format json 2>/dev/null)" || return 0
+  # Ports bound to 127.0.0.1 are fine (reachable only from the VM itself, for debugging).
+  jq -r '.services | to_entries[]
+         | {k: .key, p: [(.value.ports // [])[] | select((.host_ip // "") | test("^127[.]|^::1$") | not)]}
+         | select(.p | length > 0)
+         | "\(.k): \([.p[] | "\(.host_ip // "0.0.0.0"):\(.published)->\(.target)"] | join(", "))"' <<< "$json" |
+  while read -r line; do
+    warn "Publishes ports on the VM (bypasses Caddy, and can clash with other apps): $line"
+    info "Remove its 'ports:' (Caddy doesn't need them), or bind them to 127.0.0.1 (e.g. \"127.0.0.1:8080:8080\")."
+  done
+}
+
+# --- Commands -----------------------------------------------------------------
+
+cmd_new() {
+  local name="${1:-}" image="" port="" tpl="" t d
+  [[ -n "$name" ]] || die "Usage: ops-app new <name> --image IMAGE [--port 80] | --template T"
+  shift; valid_name "$name"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --image) image="${2:-}"; shift 2 ;;
+      --port) port="${2:-}"; shift 2 ;;
+      --template) tpl="${2:-}"; shift 2 ;;
+      *) die "Unknown option $1" ;;
+    esac
+  done
+  [[ -n "$tpl" || -n "$image" ]] || die "Give --image IMAGE (e.g. --image louislam/uptime-kuma:1 --port 3001) or --template ($(ls "$TEMPLATES_DIR" | tr '\n' ' '))"
+  [[ -n "$tpl" ]] || tpl=basic
+  t="$TEMPLATES_DIR/$tpl"
+  [[ -d "$t" ]] || die "No template '$tpl'. Have: $(ls "$TEMPLATES_DIR" | tr '\n' ' ')"
+  d="$APPS_DIR/$name"
+  [[ -e "$d/compose.yml" ]] && die "$d already exists. Use: ops-app up $name"
+  need_docker
+
+  # template.conf: SERVICE, PORT, NOTE
+  local SERVICE=app PORT=80 NOTE=""
+  # shellcheck disable=SC1091
+  [[ -f "$t/template.conf" ]] && . "$t/template.conf"
+  port="${port:-$PORT}"
+  [[ "$port" =~ ^[0-9]+$ ]] || die "--port must be a number"
+
+  mkdir -p "$d"
+  local f
+  for f in compose.yml env; do
+    [[ -f "$t/$f" ]] || continue
+    local out="$d/$f"; [[ "$f" == env ]] && out="$d/.env"
+    sed -e "s|{{NAME}}|$name|g" -e "s|{{HOST}}|$(host_of "$name")|g" -e "s|{{IMAGE}}|$image|g" \
+        -e "s|{{PORT}}|$port|g" -e "s|{{SUBNET}}|$PROXY_SUBNET|g" "$t/$f" > "$out"
+    # Each {{SECRET}} becomes its own random password.
+    while grep -q '{{SECRET}}' "$out"; do
+      sed -i "0,/{{SECRET}}/s//$(gen_secret)/" "$out"
+    done
+  done
+  [[ -f "$d/.env" ]] && chmod 600 "$d/.env"
+  ok "Created $d"
+  write_route "$name" "$name:$port" 0 "$t/site.caddy"
+  info "Start it:   ops-app up $name"
+  [[ -n "$NOTE" ]] && info "$NOTE"
+  [[ "$tpl" == basic ]] && info "Check $d/compose.yml first: add volumes for the app's data."
+  return 0
+}
+
+cmd_adopt() {
+  local name="${1:-}" port="" svc="" d="" services
+  [[ -n "$name" ]] || die "Usage: ops-app adopt <name> --port N [--service S] [--dir DIR]"
+  shift; valid_name "$name"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port) port="${2:-}"; shift 2 ;;
+      --service) svc="${2:-}"; shift 2 ;;
+      --dir) d="${2:-}"; shift 2 ;;
+      *) die "Unknown option $1" ;;
+    esac
+  done
+  [[ "$port" =~ ^[0-9]+$ ]] || die "--port N is required: the port the app listens on INSIDE its container (Kontor: 8080)"
+  d="$(cd "${d:-$APPS_DIR/$name}" 2>/dev/null && pwd)" || die "Folder not found: ${d:-$APPS_DIR/$name} (clone the app there, or pass --dir)"
+  need_docker
+
+  # The project's own .env (e.g. Kontor's) may select files and profiles.
+  local env="$d/.env" profiles
+  profiles="$(grep -E '^COMPOSE_PROFILES=' "$env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'" || true)"
+  if [[ -n "$profiles" ]]; then
+    warn "COMPOSE_PROFILES=$profiles in $env."
+    info "If that's the app's own front door (Kontor: caddy / tailscale / cloudflare), set COMPOSE_PROFILES="
+    info "empty: the shared Caddy is the front door now, and two would fight over ports 80/443."
+  fi
+
+  # Kontor answers only for its own hostname.
+  if grep -qE '^KONTOR_HOSTNAME=$' "$env"; then
+    sed -i -E "s|^KONTOR_HOSTNAME=$|KONTOR_HOSTNAME=$(host_of "$name")|" "$env"
+    info "Set KONTOR_HOSTNAME=$(host_of "$name") in $env"
+  elif grep -qE '^KONTOR_HOSTNAME=' "$env" && ! grep -qxF "KONTOR_HOSTNAME=$(host_of "$name")" "$env"; then
+    warn "KONTOR_HOSTNAME in $env isn't $(host_of "$name"); Kontor will refuse requests for that name."
+  fi
+
+  services="$(compose "$d" config --services 2>/dev/null)" || die "docker compose can't read $d. Fix its .env first: cd $d && docker compose config"
+  if [[ -z "$svc" ]]; then
+    if [[ "$(wc -l <<< "$services")" -eq 1 ]]; then svc="$services"
+    elif grep -qx "$name" <<< "$services"; then svc="$name"
+    else die "Which service should Caddy reach? Add --service, one of: $(tr '\n' ' ' <<< "$services")"; fi
+  fi
+  grep -qx "$svc" <<< "$services" || die "No service '$svc' in $d. Have: $(tr '\n' ' ' <<< "$services")"
+
+  write_overlay "$d" "$svc" "$name"
+  link_overlay "$d"
+
+  warn_published_ports "$d"
+  ok "$svc in $d joins the proxy network as '$name'"
+  write_route "$name" "$name:$port" 0
+  info "Apply it:   ops-app up $name   (recreates the container on the proxy network)"
+}
+
+cmd_route() {
+  local name="${1:-}" up="${2:-}" insecure=0
+  [[ -n "$name" && -n "$up" ]] || die "Usage: ops-app route <name> <address> [--insecure]   e.g. ops-app route adguard 192.168.1.2:80"
+  valid_name "$name"
+  [[ "$up" =~ ^(https?://)?[A-Za-z0-9._-]+(:[0-9]+)?$ ]] ||
+    die "Address '$up' should look like host:port, 192.168.1.2:80 or https://192.168.1.10:8006"
+  [[ "${3:-}" == --insecure ]] && insecure=1
+  [[ "$up" == https://* && $insecure -eq 0 ]] && info "Tip: if it uses a self-signed certificate (Proxmox does), add --insecure"
+  write_route "$name" "$up" "$insecure"
+}
+
+cmd_unroute() {
+  local name="${1:-}" f
+  [[ -n "$name" ]] || die "Usage: ops-app unroute <name>"
+  f="$SITES/$name.caddy"
+  [[ -f "$f" ]] || die "No route named '$name' (see: ops-app list)"
+  local bak; bak="$(mktemp "$SITES/.bak.XXXX")"; mv "$f" "$bak"
+  # apply_config restores on failure; on success we drop the backup ourselves.
+  if caddy_running && ! docker exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
+    mv -f "$bak" "$f"; die "Caddy rejected the config without $name; left it in place."
+  fi
+  rm -f "$bak"
+  caddy_running && docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1
+  ok "Removed https://$(host_of "$name") (the app itself, if any, is untouched)"
+}
+
+route_upstream() { awk '$1 == "reverse_proxy" { print $2; exit }' "$1"; }
+
+cmd_list() {
+  local f name up state
+  printf '%s%-14s %-36s %-26s %s%s\n' "$B" NAME URL "GOES TO" STATE "$N"
+  shopt -s nullglob
+  for f in "$SITES"/*.caddy; do
+    name="$(basename "$f" .caddy)"; up="$(route_upstream "$f")"
+    if [[ -d "$APPS_DIR/$name" ]]; then
+      local running total
+      running="$(compose "$APPS_DIR/$name" ps --status running -q 2>/dev/null | wc -l)"
+      total="$(compose "$APPS_DIR/$name" config --services 2>/dev/null | wc -l)"
+      if (( running == 0 )); then state="${R}stopped${N}"
+      elif (( running < total )); then state="${Y}$running/$total running${N}"
+      else state="${G}running${N}"; fi
+    else
+      state="${D}outside Docker${N}"
+    fi
+    printf '%-14s %-36s %-26s %s\n' "$name" "https://$(host_of "$name")" "$up" "$state"
+  done
+  shopt -u nullglob
+}
+
+cmd_compose() { # action name [args]
+  local a="$1" name="${2:-}" d
+  [[ -n "$name" ]] || die "Usage: ops-app $a <name>"
+  shift 2
+  d="$APPS_DIR/$name"
+  [[ -d "$d" ]] || die "No app folder $d"
+  need_docker
+  case "$a" in
+    up)      compose "$d" up -d --remove-orphans "$@"; ok "https://$(host_of "$name")" ;;
+    down)    compose "$d" down "$@" ;;
+    restart) compose "$d" restart "$@" ;;
+    pull)    compose "$d" pull "$@" && compose "$d" up -d "$@" ;;
+    ps)      compose "$d" ps "$@" ;;
+    logs)    compose "$d" logs --tail 100 -f "$@" ;;
+  esac
+}
+
+cmd_ca() {
+  local crt="$PROXY/public/root.crt"
+  if [[ "${1:-}" == --print ]]; then cat "$crt"; return; fi
+  if [[ ! -s "$crt" ]]; then
+    if grep -q acme_dns "$PROXY/conf/Caddyfile" 2>/dev/null; then
+      ok "Certificates come from Let's Encrypt (PROXY_TLS=cloudflare): nothing to install on devices."; return
+    fi
+    die "No root certificate exported yet. Re-run the app-proxy module, or check: docker logs caddy"
+  fi
+  cat <<EOF
+${B}Trust your apps' certificates (once per device)${N}
+Caddy signs every https://*.$APPS_DOMAIN certificate with its own root. Install that root
+once on each device and all apps, current and future, show a padlock.
+
+  Download it:  http://ca.$APPS_DOMAIN        (open on the device itself; works once DNS is set up)
+  File here:    $crt
+  Fingerprint:  $(openssl x509 -in "$crt" -noout -fingerprint -sha256 | cut -d= -f2)
+
+  Linux (Arch/Omarchy): sudo trust anchor --store root.crt
+  Linux (Debian/Ubuntu): sudo cp root.crt /usr/local/share/ca-certificates/home-apps.crt && sudo update-ca-certificates
+  macOS:   open root.crt -> Keychain Access -> double-click it -> Trust -> Always Trust
+  Windows: double-click root.crt -> Install -> Local Machine -> Trusted Root Certification Authorities
+  iPhone:  open the link in Safari -> Settings -> Profile Downloaded -> Install, then
+           Settings -> General -> About -> Certificate Trust Settings -> turn it on
+  Android: Settings -> Security -> Encryption & credentials -> Install a certificate -> CA certificate
+  Firefox has its own store: Settings -> Privacy & Security -> Certificates -> View -> Import
+
+Anyone holding the root's private key could forge certificates for your devices. It never
+leaves the caddy-data volume on this VM; keep the VM's backups private.
+EOF
+}
+
+cmd_doctor() {
+  local fails=0 f name up host port ips
+  need_docker
+  docker network inspect proxy >/dev/null 2>&1 && ok "Docker network 'proxy' exists" || { bad "No 'proxy' network: re-run the app-proxy module"; fails=1; }
+  if caddy_running; then
+    ok "Caddy is running"
+    if docker exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then ok "Caddy config is valid"
+    else bad "Caddy config is invalid: docker exec caddy caddy validate --config /etc/caddy/Caddyfile"; fails=1; fi
+  else
+    bad "Caddy is not running: cd $PROXY && docker compose up -d && docker logs caddy"; fails=1
+  fi
+
+  # Only Caddy should publish ports.
+  local others
+  others="$(docker ps --format '{{.Names}}\t{{.Ports}}' | awk -F'\t' '$1 != "caddy" && $2 ~ /(0\.0\.0\.0|::|\[::\]):[0-9]+->/ { print $1 }')"
+  if [[ -n "$others" ]]; then
+    warn "These containers publish ports on the VM (bypassing Caddy and the firewall): $(tr '\n' ' ' <<< "$others")"
+  else
+    ok "Only Caddy publishes ports"
+  fi
+
+  ips=" $(vm_ips | tr "\n" " ") 127.0.0.1 "
+  shopt -s nullglob
+  for f in "$SITES"/*.caddy; do
+    name="$(basename "$f" .caddy)"; host="$(host_of "$name")"; up="$(route_upstream "$f")"
+    local got; got="$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1 { print $1 }' || true)"
+    if [[ -z "$got" ]]; then
+      warn "$host doesn't resolve here. Add the AdGuard rewrite *.$APPS_DOMAIN -> this VM ($(vm_ip))"
+    elif [[ "$ips" != *" $got "* ]]; then
+      warn "$host resolves to $got, not this VM ($(vm_ip))"
+    else
+      ok "$host resolves to this VM"
+    fi
+    # Can Caddy reach the app?
+    local hp="${up#*://}"; hp="${hp%%/*}"
+    port="${hp##*:}"; [[ "$hp" == *:* ]] || port=$([[ "$up" == https://* ]] && echo 443 || echo 80)
+    if caddy_running && docker exec caddy nc -z -w 3 "${hp%:*}" "$port" >/dev/null 2>&1; then
+      ok "  Caddy reaches $name at $up"
+    else
+      if [[ -d "$APPS_DIR/$name" ]]; then bad "  Caddy can't reach $name at $up (not running, or not on the proxy network? ops-app up $name)"
+      else bad "  Caddy can't reach $name at $up (is it on? reachable from this VM? curl -kI $up)"; fi
+      fails=1
+    fi
+  done
+  shopt -u nullglob
+  [[ -s "$PROXY/public/root.crt" ]] && ok "Root certificate exported (ops-app ca)"
+  return "$fails"
+}
+
+cmd_reload() {
+  caddy_running || die "Caddy isn't running: cd $PROXY && docker compose up -d"
+  docker exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null ||
+    die "Config invalid (see above); Caddy keeps running the last good one"
+  docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
+  ok "Caddy reloaded"
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  new)     cmd_new "$@" ;;
+  adopt)   cmd_adopt "$@" ;;
+  route)   cmd_route "$@" ;;
+  unroute) cmd_unroute "$@" ;;
+  list|ls) cmd_list ;;
+  up|down|restart|pull|ps|logs) cmd_compose "$cmd" "$@" ;;
+  ca)      cmd_ca "$@" ;;
+  doctor)  cmd_doctor ;;
+  reload)  cmd_reload ;;
+  help|-h|--help) usage ;;
+  *) usage >&2; exit 1 ;;
+esac

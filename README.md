@@ -39,6 +39,7 @@ For repeatable setups, scripts and (later) Terraform, the same modules also run 
 - [Modules](#modules)
 - [Tools installed](#tools-installed)
 - [Tailscale](#tailscale)
+- [Home lab on Proxmox](#home-lab-on-proxmox)
 - [Configuration reference](#configuration-reference)
 - [Audit](#audit)
 - [Destroying an instance](#destroying-an-instance)
@@ -229,7 +230,16 @@ ops-scripts/
 │   ├── 65-tailscale.sh     # optional: private VPN access, Tailscale SSH
 │   ├── 70-docker.sh        # optional
 │   ├── 75-aws-cli.sh       # optional
-│   └── 80-nginx.sh         # optional (+ certbot / HTTPS)
+│   ├── 80-nginx.sh         # optional (+ certbot / HTTPS)
+│   ├── 85-app-proxy.sh     # optional: Caddy for all Docker apps + ops-app
+│   └── 87-adguard.sh       # optional: AdGuard Home DNS
+├── machines/               # Proxmox recipes: dns (AdGuard LXC), apps (Docker VM), lxc, vm
+├── proxmox/
+│   └── new-machine.sh      # creates an LXC/VM from a recipe and sets it up (the UI's "New machine")
+├── apps/
+│   ├── ops-app             # the ops-app command (installed to /usr/local/bin)
+│   ├── proxy/              # Caddy's compose file
+│   └── templates/          # ops-app new --template: basic, nextcloud
 ├── checks/
 │   ├── audit.sh            # Read-only security/health report (--json for the UI)
 │   └── fix.sh              # One fix per audit problem (the UI runs these on Enter)
@@ -343,6 +353,7 @@ Precedence: **config file > environment variables > defaults**.
 | `examples/web-server.env` | A website on nginx with Let's Encrypt HTTPS |
 | `examples/docker-host.env` | Apps in Docker containers, nginx in front, AWS CLI for ECR |
 | `examples/minimal.env` | Hardened base only, no web ports |
+| `machines/*.env` | Home lab recipes for Proxmox (`dns`, `apps`, `lxc`, `vm`); see [Home lab on Proxmox](#home-lab-on-proxmox) |
 
 ---
 
@@ -366,6 +377,8 @@ They run in numeric order. All of them are **idempotent**, so re-running only ch
 | `docker` | off | Docker Engine + compose/buildx plugins from Docker's repo, log rotation, admin user in `docker` group |
 | `aws-cli` | off | AWS CLI v2 |
 | `nginx` | off | nginx with version hidden, `snippets/security-headers.conf`, certbot. Requests a certificate if `CERTBOT_DOMAINS` is set |
+| `app-proxy` | off | Caddy in front of all Docker apps at `https://<name>.$APPS_DOMAIN`, the shared `proxy` network, and the `ops-app` command (see [Home lab on Proxmox](#home-lab-on-proxmox)). Needs `docker`; not together with `nginx` |
+| `adguard` | off | AdGuard Home DNS, set up without the wizard, with `ADGUARD_REWRITES` for local names. Best on its own small LXC |
 
 ---
 
@@ -533,6 +546,138 @@ Safety: the firewall only closes public SSH **while Tailscale is connected**. If
 
 ---
 
+## Home lab on Proxmox
+
+Run Kontor, Nextcloud and anything else on Proxmox, each at its own name with HTTPS, for your network only. Later you can reach them from anywhere through Tailscale. `./ops` on the Proxmox host creates the machines for you from *recipes*, and explains each step as it goes.
+
+```
+Proxmox
+├── LXC "dns"   192.168.1.2    AdGuard Home: ad blocking + *.home.internal -> 192.168.1.50
+└── VM  "apps"  192.168.1.50   Docker
+      ├── caddy       the ONLY container with ports (80, 443); picks the app by name
+      ├── kontor      ┐ on the shared "proxy" network, no ports of their own,
+      ├── nextcloud   │ so apps can never clash over a port
+      │    └── db, redis   (private to Nextcloud: Caddy and other apps can't see them)
+      └── ...         ┘
+```
+
+**How a request flows:** your laptop asks AdGuard for `nextcloud.home.internal` and gets `192.168.1.50`. The browser connects to port 443 there, and Caddy reads the name and forwards the request to the `nextcloud` container. Every app uses the same port 443; only the name differs.
+
+**Certificates:** Caddy runs its own small certificate authority and gives every app a certificate automatically. You install Caddy's root certificate **once per device**, and every app (now and later) shows a padlock. If you'd rather install nothing, buy a domain on Cloudflare and set `PROXY_TLS=cloudflare`: Caddy then gets real Let's Encrypt certificates through Cloudflare's DNS. Nothing is exposed to the internet either way.
+
+**Security, by default:** Caddy answers only the LAN and the tailnet (`PROXY_ALLOW_FROM`); anyone else gets 403, even if a port is forwarded by mistake. Apps publish no ports. Databases sit on each app's private network. Caddy runs read-only with no Linux capabilities except binding ports 80/443. Proxmox's web UI and SSH are never port-forwarded.
+
+### 1. Run ops on the Proxmox host
+
+Everything is created from the Proxmox host itself. In the Proxmox web UI → your node → **Shell** (or `ssh root@<proxmox>`):
+
+```bash
+apt install -y git
+git clone https://github.com/owlendev/ops-scripts.git && cd ops-scripts
+./ops
+```
+
+On a Proxmox host, the menu starts with **New machine** and **Machines**. (**Guided setup** there changes the Proxmox host itself, which you usually don't want.)
+
+### 2. Create the machines
+
+**New machine** lists *recipes*: what kind of machine each is and what runs on it. Move through them to read what each one does, then press Enter on one. It asks a few questions (name, a free fixed IP, your login user and SSH key, the recipe's own settings) and shows every step before anything is created. Then it:
+
+1. checks the plan: the ID, name and IP are free, and the storage and bridge exist;
+2. downloads Debian once (a container template, or Debian's cloud image for VMs, checksum verified);
+3. creates the LXC (unprivileged) or VM (cloud-init);
+4. starts it and waits until it's online;
+5. creates your login user with your SSH key and sudo;
+6. copies ops-scripts into it (`/opt/ops-scripts`) with its settings (`clients/<name>.env`);
+7. runs the recipe's modules inside it, each one explaining itself;
+8. links things up: when the apps VM and the AdGuard machine both exist, `*.home.internal` points at the apps VM.
+
+Make them in this order:
+
+1. **`dns`** (LXC): AdGuard Home. Give it a fixed IP like `192.168.1.2`. Afterwards, set your **router's** DHCP DNS server to that IP.
+2. **`apps`** (VM): Docker + Caddy + `ops-app`. Give it a fixed IP like `192.168.1.50`. Its DNS server defaults to the AdGuard machine.
+3. On each device: open `http://ca.home.internal` and install the certificate (or run `ops-app ca` on the VM for the steps).
+4. On the VM: `ops-app doctor` checks Caddy, DNS, and every app.
+
+**When a step fails**, it prints **why** and **How to fix**, and the machine is kept. Fix the cause, then open **New machine → finish <name>** (or run `sudo proxmox/new-machine.sh --resume <id>`). That re-runs the remaining steps, and anything already done is quick. **Machines** lists what exists, how to log in, and anything unfinished.
+
+**Without the UI**, the same works from the shell:
+
+```bash
+sudo proxmox/new-machine.sh --recipe dns --name dns --ip 192.168.1.2/24 \
+     --user omar --ssh-key "$(cat ~/.ssh/id_ed25519.pub)"
+sudo proxmox/new-machine.sh --list
+```
+
+### Recipes: more machines later
+
+A recipe is one file in `machines/`, with the same settings as any config file plus a header the UI reads:
+
+```bash
+# Uptime monitor: watches your apps and sends alerts (small LXC)     ← line 1: the summary in the list
+# What it is and why, in a few lines...                              ← shown when it's highlighted
+#
+# ask: TIMEZONE | Timezone | e.g. UTC, Asia/Riyadh                    ← a question in the UI
+# ask: SOME_TOKEN | API token | where to get it | secret               ← secret: never saved to files
+# next: Open http://{ip}:3001/                                        ← shown when it's done ({ip} {id} {name} {user})
+PVE_KIND=lxc          # lxc or vm
+PVE_CORES=1
+PVE_MEMORY=1024       # MB
+PVE_DISK=8            # GB
+ENABLE_DOCKER=yes     # any modules and settings, exactly like a client config
+```
+
+It comes with `dns`, `apps`, `lxc` (a plain hardened container) and `vm` (a plain hardened VM). Copy one to make yours; it appears in **New machine** right away. A recipe also works on a machine you made by hand: `sudo ./bootstrap.sh -c machines/dns.env`.
+
+**LXC or VM?** Use an LXC for single services that don't need Docker (AdGuard, a database, a small daemon): they're light and start in seconds. Use a VM for Docker, VPNs, or anything that needs its own kernel. Inside an LXC, the modules adjust themselves: swap and kernel-wide settings belong to the Proxmox host and are skipped, and if UFW can't run, you get a warning pointing to the Proxmox firewall instead.
+
+### 3. Add apps
+
+All apps live in `/srv/apps/<name>/`. You never pick ports or edit Caddy's config.
+
+```bash
+# Kontor (its own compose files; the shared Caddy replaces its built-in front doors)
+cd /srv/apps && git clone <your-kontor-repo> kontor && cd kontor
+cp .env.example .env && chmod 600 .env
+#   in .env: COMPOSE_FILE=docker-compose.prod.yml and COMPOSE_PROFILES=  (empty)
+ops-app adopt kontor --port 8080      # sets KONTOR_HOSTNAME=kontor.home.internal
+ops-app up kontor --build             # https://kontor.home.internal
+
+# Nextcloud, from a ready-made template (Postgres + Redis + cron, passwords generated)
+ops-app new nextcloud --template nextcloud
+ops-app up nextcloud                  # https://nextcloud.home.internal (admin password: /srv/apps/nextcloud/.env)
+
+# Any image
+ops-app new uptime --image louislam/uptime-kuma:1 --port 3001
+
+# Things outside Docker get names too
+ops-app route proxmox https://192.168.1.10:8006 --insecure
+ops-app route adguard 192.168.1.2:80
+
+ops-app list                          # every name, where it goes, and whether it runs
+```
+
+`adopt` works for any existing compose project: it adds a small `compose.proxy.yml` (joins the service to the proxy network under the app's name) and lists it in `COMPOSE_FILE` in the project's `.env`. Your own compose files stay untouched. It also warns when a service still publishes ports, which you can then remove.
+
+Every route change is checked with `caddy validate` first. If Caddy rejects it, the change is undone and the running config is never broken.
+
+### 4. Later: Tailscale (from anywhere)
+
+You don't need Kontor's own Tailscale container for this. Run Tailscale **once, on the apps VM**, and let it share the two LAN addresses:
+
+1. On the apps VM, in `/opt/ops-scripts/clients/apps.env`: `ENABLE_TAILSCALE=yes`, and `TAILSCALE_ADVERTISE_ROUTES` with the apps VM and DNS box addresses (e.g. `"192.168.1.50/32 192.168.1.2/32"`). Then `sudo /opt/ops-scripts/bootstrap.sh -c /opt/ops-scripts/clients/apps.env --only firewall,tailscale`.
+2. Tailscale admin console → **Machines** → the VM → **Edit route settings** → approve both routes, and **Disable key expiry**.
+3. **DNS** → **Add nameserver** → Custom → `192.168.1.2` → **Restrict to domain** `home.internal`.
+4. On your phone, install Tailscale and the root certificate. `https://kontor.home.internal` now works away from home too, with the same name and certificate as on the LAN.
+
+Caddy already allows Tailscale addresses (`100.64.0.0/10`), so there's nothing to change there.
+
+### Backups
+
+Proxmox → **Datacenter → Backup**: back up both machines nightly. Everything lives in the VM: app folders in `/srv/apps`, data in Docker volumes, and Caddy's CA in the `proxy_caddy-data` volume. Keep backups private: the CA's private key is in them.
+
+---
+
 ## Configuration reference
 
 All variables are in `config/default.env`. The main ones:
@@ -563,6 +708,16 @@ All variables are in `config/default.env`. The main ones:
 | `AUTO_UPDATES_REBOOT` | `no` | Let unattended-upgrades reboot at `AUTO_UPDATES_REBOOT_TIME` |
 | `REBOOT_IF_REQUIRED` | `no` | Reboot at the end of bootstrap if a kernel update needs it |
 | `CERTBOT_DOMAINS` / `CERTBOT_EMAIL` | empty | Request a Let's Encrypt cert (DNS must already point to the server) |
+| `TAILSCALE_ADVERTISE_ROUTES` | empty | Subnet router: LAN addresses tailnet devices may reach, e.g. `"192.168.1.50/32 192.168.1.2/32"` |
+| `APPS_DOMAIN` | `home.internal` | Apps get `https://<name>.<this>` |
+| `APPS_DIR` | `/srv/apps` | One folder per app |
+| `PROXY_TLS` | `internal` | `internal` (Caddy's CA, trust once per device) or `cloudflare` (real certificates) |
+| `PROXY_CF_API_TOKEN` / `PROXY_ACME_EMAIL` | empty | For `cloudflare` only. The token is a **secret** |
+| `PROXY_ALLOW_FROM` | `private_ranges 100.64.0.0/10` | Who Caddy answers (LAN + Tailscale); others get 403 |
+| `PROXY_SUBNET` | `172.30.0.0/24` | Subnet of the `proxy` network; change if it clashes with your LAN |
+| `ADGUARD_REWRITES` | empty | Local names, e.g. `"*.home.internal=192.168.1.50"` |
+| `ADGUARD_USER` / `ADGUARD_PASSWORD` | `admin` / generated | Web UI login. The password is a **secret**; generated ones go to `/root/adguard-admin.txt` |
+| `ADGUARD_UPSTREAMS` | empty | Upstream DNS servers (default: AdGuard's Quad9 over HTTPS) |
 
 ---
 
@@ -787,7 +942,9 @@ If a secret leaks (committed to git, pasted in chat, sent by email), **rotate it
 4. Make it **idempotent**: check before changing, and use `write_if_changed` for config files.
 5. `chmod +x` it and run `shellcheck -x modules/NN-my-thing.sh`.
 
-Helpers in `lib/common.sh`: `info` `ok` `warn` `die` `section`, `is_true`, `apt_get` / `apt_install` (wait for the dpkg lock, never prompt), `pkg_installed`, `user_exists`, `user_home`, `current_ssh_ports`, `write_if_changed`.
+When something fails, say what to do about it: `die_fix "what went wrong" "how to fix it"` stops the module, and `warn ...; hint "how to fix"` reports a problem without stopping (end with `exit 3` for "finished with problems"). The UI highlights **How to fix** lines, and `bootstrap.sh` adds a re-run command. Use `in_container` to adjust for LXCs.
+
+Helpers in `lib/common.sh`: `info` `ok` `warn` `die` `die_fix` `hint` `in_container` `section`, `is_true`, `apt_get` / `apt_install` (wait for the dpkg lock, never prompt), `pkg_installed`, `user_exists`, `user_home`, `current_ssh_ports`, `write_if_changed`.
 
 ---
 

@@ -23,6 +23,7 @@ type Repo struct {
 
 type Module struct {
 	File, Name, Desc string
+	Detail           []string // the rest of the module's header comment
 }
 
 func findRoot(flagRoot string) (string, error) {
@@ -70,9 +71,39 @@ func (r *Repo) Modules() ([]Module, error) {
 		if i := strings.Index(base, "-"); i >= 0 {
 			name = base[i+1:]
 		}
-		mods = append(mods, Module{File: f, Name: name, Desc: secondLineComment(f)})
+		desc, detail := headerComment(f)
+		mods = append(mods, Module{File: f, Name: name, Desc: desc, Detail: detail})
 	}
 	return mods, nil
+}
+
+// headerComment returns a module's one-line summary (line 2) and the comment
+// lines after it, up to the first line of code.
+func headerComment(file string) (string, []string) {
+	fh, err := os.Open(file)
+	if err != nil {
+		return "", nil
+	}
+	defer fh.Close()
+	sc := bufio.NewScanner(fh)
+	var desc string
+	var detail []string
+	for i := 0; sc.Scan(); i++ {
+		line := sc.Text()
+		if i == 0 {
+			continue
+		}
+		if !strings.HasPrefix(line, "#") {
+			break
+		}
+		text := strings.TrimSpace(strings.TrimPrefix(line, "#"))
+		if i == 1 {
+			desc = text
+		} else if text != "" {
+			detail = append(detail, text)
+		}
+	}
+	return desc, detail
 }
 
 func secondLineComment(file string) string {

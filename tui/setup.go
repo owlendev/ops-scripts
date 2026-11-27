@@ -45,6 +45,13 @@ var settings = []setting{
 	{Key: "TAILSCALE_HOSTNAME", Label: "Tailnet name", Help: "e.g. acme-web (empty = system hostname)", Module: "tailscale"},
 	{Key: "TAILSCALE_SSH", Label: "Enable Tailscale SSH", Module: "tailscale", Kind: kindBool},
 	{Key: "TAILSCALE_SSH_ONLY", Label: "Close public SSH once Tailscale is connected", Module: "tailscale", Kind: kindBool},
+	{Key: "TAILSCALE_ADVERTISE_ROUTES", Label: "Share LAN addresses with the tailnet", Help: "subnet router, e.g. 192.168.1.50/32 192.168.1.2/32 (empty = none)", Module: "tailscale", Validate: match(`^([0-9a-fA-F.:]+/[0-9]+( +|$))*$`, "use CIDRs like 192.168.1.50/32, space separated")},
+	{Key: "APPS_DOMAIN", Label: "Apps domain", Help: "apps get https://<name>.<this>, e.g. home.internal", Module: "app-proxy", Validate: match(`^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$`, "a domain like home.internal")},
+	{Key: "PROXY_TLS", Label: "Certificates", Help: "internal (Caddy's own CA, trust once per device) or cloudflare (real certs, needs a domain)", Module: "app-proxy", Validate: match(`^(internal|cloudflare)$`, "internal or cloudflare")},
+	{Key: "PROXY_CF_API_TOKEN", Label: "Cloudflare API token", Help: "only for cloudflare: Zone.DNS edit. Never saved to files.", Module: "app-proxy", Kind: kindSecret},
+	{Key: "PROXY_ACME_EMAIL", Label: "Let's Encrypt email", Help: "only for cloudflare", Module: "app-proxy"},
+	{Key: "ADGUARD_REWRITES", Label: "Local names", Help: "e.g. *.home.internal=192.168.1.50 (the apps VM)", Module: "adguard", Validate: match(`^([^ =]+=[0-9a-fA-F.:]+( +|$))*$`, "use name=ip, space separated")},
+	{Key: "ADGUARD_PASSWORD", Label: "AdGuard admin password", Help: "empty = generated, saved to /root/adguard-admin.txt. Never saved to files.", Module: "adguard", Kind: kindSecret},
 	{Key: "CERTBOT_DOMAINS", Label: "HTTPS domains", Help: "e.g. acme.com www.acme.com (DNS must point here; empty = skip)", Module: "nginx"},
 	{Key: "CERTBOT_EMAIL", Label: "HTTPS email", Help: "Let's Encrypt expiry notices", Module: "nginx"},
 	{Key: "REBOOT_IF_REQUIRED", Label: "Reboot at the end if updates need it", Kind: kindBool},
@@ -251,7 +258,13 @@ func (p *setupPage) review() string {
 	if len(p.mods) == 0 {
 		return sYel.Render("No modules selected: nothing will run.")
 	}
-	b.WriteString("Modules: " + strings.Join(p.mods, ", ") + "\n")
+	b.WriteString("What will run, in order:\n")
+	for _, m := range p.modules {
+		if p.on(m.Name) {
+			b.WriteString(fmt.Sprintf("  • %-16s %s\n", m.Name, sMuted.Render(m.Desc)))
+		}
+	}
+	b.WriteString("\n")
 	if p.on("cli-tools") {
 		b.WriteString(fmt.Sprintf("CLI tools: %d selected\n", len(p.cli)))
 	}
@@ -263,6 +276,15 @@ func (p *setupPage) review() string {
 	}
 	if p.on("tailscale") && *p.bools["TAILSCALE_SSH_ONLY"] {
 		b.WriteString(sYel.Render("! Public SSH closes once Tailscale is connected.") + "\n")
+	}
+	if isProxmox() {
+		b.WriteString(sYel.Render("! This is the Proxmox host itself: these modules change THIS machine. For a new LXC/VM, go back and use New machine.") + "\n")
+	}
+	if p.on("app-proxy") && !p.on("docker") {
+		b.WriteString(sYel.Render("! app-proxy needs docker: tick docker too (unless Docker is already installed).") + "\n")
+	}
+	if p.on("app-proxy") && p.on("nginx") {
+		b.WriteString(sYel.Render("! app-proxy and nginx both want ports 80/443: pick one.") + "\n")
 	}
 	return b.String()
 }
@@ -348,7 +370,7 @@ func (p *setupPage) finish() tea.Cmd {
 	if note != "" {
 		title += "  " + sMuted.Render("("+note+")")
 	}
-	st := step{Args: []string{"bash", p.repo.path("bootstrap.sh"), "-c", tmp.Name()}, Env: os.Environ()}
+	st := step{Args: []string{"bash", p.repo.path("bootstrap.sh"), "-c", tmp.Name()}, Env: append(os.Environ(), "OPS_UI=1")}
 	return tea.Sequence(pop(nil), push(newRun(title, []step{st}, func(bool) tea.Cmd {
 		os.Remove(tmp.Name())
 		return nil

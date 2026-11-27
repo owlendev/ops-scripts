@@ -200,7 +200,11 @@ func (p *runPage) append(lines ...string) {
 
 func (p *runPage) trackModule(l string) {
 	plain := ansi.Strip(l)
-	if name, ok := strings.CutPrefix(plain, "==> Module: "); ok {
+	name, ok := strings.CutPrefix(plain, "==> Module: ")
+	if !ok {
+		name, ok = strings.CutPrefix(plain, "==> Step: ")
+	}
+	if ok {
 		if n := len(p.modules); n > 0 && p.modules[n-1].state == stepRunning {
 			p.modules[n-1].state = stepOK
 		}
@@ -227,6 +231,12 @@ func styleLine(l string) string {
 		return sYel.Render(plain)
 	case strings.Contains(plain, "] FAIL") || strings.HasPrefix(strings.TrimSpace(plain), "FAIL"):
 		return sRed.Render(plain)
+	case strings.HasPrefix(strings.TrimSpace(plain), "How to fix:"):
+		return sYel.Bold(true).Render(plain)
+	case strings.HasPrefix(strings.TrimSpace(plain), "Why:"):
+		return sRed.Render(plain)
+	case strings.HasPrefix(strings.TrimSpace(plain), "Next:"):
+		return sAcc.Render(plain)
 	case strings.HasPrefix(plain, "▶"):
 		return l
 	}
@@ -312,7 +322,8 @@ func (p *runPage) finishStep(err error) tea.Cmd {
 		if ee, ok := err.(*exec.ExitError); ok {
 			msg = fmt.Sprintf("exit code %d", ee.ExitCode())
 		}
-		p.append("", sRed.Render("✗ "+p.label(p.cur)+" failed ("+msg+")"))
+		p.append("", sRed.Render("✗ "+p.label(p.cur)+" failed ("+msg+")"),
+			sMuted.Render("  The reason and what to do are in the FAIL / How to fix lines above (↑ to scroll)."))
 	} else {
 		p.states[p.cur] = stepOK
 		if len(p.steps) > 1 {

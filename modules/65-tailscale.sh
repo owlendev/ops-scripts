@@ -33,6 +33,22 @@ is_true "$TAILSCALE_SSH" && ssh_flag=true
 flags=(--ssh="$ssh_flag")
 [[ -n "$TAILSCALE_HOSTNAME" ]] && flags+=(--hostname="$TAILSCALE_HOSTNAME")
 
+# Subnet router: lets tailnet devices reach LAN addresses through this machine
+# (e.g. the apps VM and the AdGuard box, so https://<app>.home.internal works anywhere).
+routes="$(tr ' ' '\n' <<< "${TAILSCALE_ADVERTISE_ROUTES:-}" | grep -v '^$' | paste -sd, - || true)"
+flags+=(--advertise-routes="$routes")
+if [[ -n "$routes" ]]; then
+  write_if_changed /etc/sysctl.d/99-tailscale.conf 0644 <<'EOF' && sysctl -q -p /etc/sysctl.d/99-tailscale.conf || true
+# Managed by ops-scripts (modules/65-tailscale.sh): forwarding for the subnet router
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+EOF
+  if ufw status 2>/dev/null | grep -q 'Status: active'; then
+    ufw route allow in on tailscale0 comment 'Tailscale subnet routes' >/dev/null
+  fi
+  info "Advertising routes: $routes (approve once: admin console → Machines → this machine → Edit route settings)"
+fi
+
 if tailscale_online; then
   tailscale set "${flags[@]}"
   ok "Already connected; applied settings (Tailscale SSH: $ssh_flag)"

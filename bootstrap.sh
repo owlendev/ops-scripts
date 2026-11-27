@@ -107,15 +107,31 @@ for f in "${MODULES[@]}"; do
   fi
 
   section "Module: $n"
+  desc="$(sed -n '2s/^# *//p' "$f")"
+  [[ -n "$desc" ]] && info "$desc"
   rc=0
-  bash "$f" || rc=$?
+  modlog="$(mktemp)"
+  if bash "$f" 2>&1 | tee "$modlog"; then rc=0; else rc=${PIPESTATUS[0]}; fi
   if (( rc == 3 )); then
     # Finished, but some optional items failed (it printed why and how to fix).
     warn "Module '$n' finished with problems; continuing"
     partial+=("$n")
   elif (( rc != 0 )); then
-    die "Module '$n' failed. Fix the problem and re-run; finished modules will be skipped quickly."
+    rerun="sudo $OPS_ROOT/bootstrap.sh${OPS_CONFIG:+ -c $OPS_CONFIG} --only $n"
+    [[ -n "${OPS_UI:-}" ]] && rerun="in ops: Run a module → $n (or Guided setup again)"
+    err "Module '$n' failed, so the run stopped here (modules after it didn't run)."
+    if ! grep -q 'How to fix:' "$modlog"; then
+      explain_failure "$modlog" "$n"
+      printf '     Why:        %s\n' "$REASON" >&2
+      printf '%s     How to fix:%s %s\n' "$C_YELLOW" "$C_RESET" "$HINT" >&2
+    fi
+    printf '     Then re-run just this part:  %s\n' "$rerun" >&2
+    [[ -z "${OPS_UI:-}" ]] && printf '     ...or everything (finished modules are quick):  sudo %s/bootstrap.sh%s\n' \
+      "$OPS_ROOT" "${OPS_CONFIG:+ -c $OPS_CONFIG}" >&2
+    rm -f "$modlog"
+    exit 1
   fi
+  rm -f "$modlog"
   ran+=("$n")
 done
 

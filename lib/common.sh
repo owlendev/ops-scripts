@@ -222,6 +222,18 @@ explain_failure() {
   elif grep -qE "ADMIN_USER .* does not exist" "$log"; then
     REASON="The login user doesn't exist"
     HINT="Set ADMIN_USER to the user you SSH in as, then retry"
+  elif grep -qE 'Port [0-9]+ is used by' "$log"; then
+    REASON="$(grep -oE "Port [0-9]+ is used by '[^']+'" "$log" | tail -1)"
+    HINT="Stop that program, or don't enable two modules that both serve web ports (app-proxy and nginx)"
+  elif grep -qE "Docker isn't running|Cannot connect to the Docker daemon" "$log"; then
+    REASON="Docker isn't installed or isn't running"
+    HINT="Enable the docker module too, or start it: sudo systemctl start docker"
+  elif grep -qE 'No SSH public key in' "$log"; then
+    REASON="The login user has no SSH key, so turning off password login would lock you out"
+    HINT="Add your key first (from your laptop: ssh-copy-id $ADMIN_USER@<this machine>), or untick ssh-hardening"
+  elif grep -qiE 'Temporary failure in name resolution|Could not resolve host' "$log"; then
+    REASON="This machine can't look up names (DNS isn't working)"
+    HINT="Check /etc/resolv.conf has a working DNS server (your router or AdGuard): getent hosts deb.debian.org"
   elif grep -qiE 'Terminated|Killed|cancel' "$log"; then
     REASON="Interrupted before it finished"
     HINT="Run it again and let it finish (LazyVim can take a few minutes)"
@@ -229,6 +241,24 @@ explain_failure() {
     REASON="${last:-Failed; see /var/log/ops-bootstrap.log}"
     HINT="Full output: /var/log/ops-bootstrap.log"
   fi
+}
+
+# die_fix WHAT FIX: stop with what went wrong and what to do about it. bootstrap.sh
+# and the ops UI show the "How to fix" line prominently.
+die_fix() {
+  printf '%s[%s] FAIL%s %s\n' "$C_RED" "$(_ts)" "$C_RESET" "$1" >&2
+  printf '%s     How to fix:%s %s\n' "$C_YELLOW" "$C_RESET" "$2" >&2
+  exit 1
+}
+
+# hint TEXT: a "How to fix" line after a WARN, for problems that don't stop the run.
+hint() { printf '%s     How to fix:%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+
+# True inside a container (e.g. a Proxmox LXC). The Proxmox host then owns the
+# kernel, swap and clock, so modules skip or soften those parts.
+in_container() {
+  if command -v systemd-detect-virt >/dev/null; then systemd-detect-virt -cq && return 0; fi
+  grep -qa 'container=' /proc/1/environ 2>/dev/null
 }
 
 tailscale_online() {

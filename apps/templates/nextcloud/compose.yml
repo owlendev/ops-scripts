@@ -1,0 +1,63 @@
+# Nextcloud: https://{{HOST}}
+# Made by `ops-app new --template nextcloud`. Start: ops-app up {{NAME}}
+#
+# Only 'app' joins the proxy network. The database and Redis stay on this app's own
+# private network: Caddy and the other apps can't reach them.
+# Updating: bump the 'nextcloud' tag ONE major version at a time (32 -> 33 -> 34), then
+# ops-app pull {{NAME}}. Nextcloud can't skip major versions.
+name: {{NAME}}
+
+x-nextcloud: &nextcloud
+  image: nextcloud:32-apache
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    POSTGRES_HOST: db
+    REDIS_HOST: redis
+    NEXTCLOUD_TRUSTED_DOMAINS: {{HOST}}
+    TRUSTED_PROXIES: {{SUBNET}}        # the proxy network: trust Caddy's X-Forwarded-For
+    OVERWRITEPROTOCOL: https
+    OVERWRITEHOST: {{HOST}}
+    OVERWRITECLIURL: https://{{HOST}}
+    PHP_UPLOAD_LIMIT: 16G
+    PHP_MEMORY_LIMIT: 1G
+  volumes:
+    - nextcloud:/var/www/html
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  app:
+    <<: *nextcloud
+    depends_on: [db, redis]
+    networks:
+      default: {}
+      proxy:
+        aliases: [{{NAME}}]
+
+  cron:                                 # background jobs every 5 minutes
+    <<: *nextcloud
+    entrypoint: /cron.sh
+    depends_on: [app]
+
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - db:/var/lib/postgresql/data
+    security_opt: ["no-new-privileges:true"]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  nextcloud:
+  db:
+
+networks:
+  proxy:
+    external: true

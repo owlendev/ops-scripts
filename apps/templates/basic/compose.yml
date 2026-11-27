@@ -1,0 +1,29 @@
+# {{NAME}}: https://{{HOST}}
+# Made by `ops-app new`. Start: ops-app up {{NAME}}   Logs: ops-app logs {{NAME}}
+#
+# No `ports:` on purpose. Caddy reaches this app as {{NAME}}:{{PORT}} over the shared
+# 'proxy' network, so it can never clash with another app's port.
+name: {{NAME}}
+
+services:
+  app:
+    image: {{IMAGE}}
+    restart: unless-stopped
+    # env_file: .env               # settings / secrets for the app (chmod 600 .env)
+    # volumes:                     # keep the app's data across updates; the path
+    #   - data:/data               # inside depends on the image (see its docs)
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      default: {}
+      proxy:
+        aliases: [{{NAME}}]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+# volumes:
+#   data:
+
+networks:
+  proxy:
+    external: true

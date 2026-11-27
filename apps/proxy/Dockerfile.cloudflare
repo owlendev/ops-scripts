@@ -1,0 +1,8 @@
+# Caddy with the Cloudflare DNS plugin, for PROXY_TLS=cloudflare (real Let's Encrypt
+# certificates for private names, proved through DNS: nothing exposed to the internet).
+ARG CADDY_VERSION=2.11.6
+FROM caddy:${CADDY_VERSION}-builder AS build
+RUN xcaddy build --with github.com/caddy-dns/cloudflare
+
+FROM caddy:${CADDY_VERSION}
+COPY --from=build /usr/bin/caddy /usr/bin/caddy
