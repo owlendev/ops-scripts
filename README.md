@@ -633,16 +633,42 @@ It comes with `dns`, `apps`, `lxc` (a plain hardened container) and `vm` (a plai
 
 ### 3. Add apps
 
-All apps live in `/srv/apps/<name>/`. You never pick ports or edit Caddy's config.
+All apps live in `/srv/apps/<name>/`. You never pick ports or edit Caddy's config. On the VM, `sudo /opt/ops-scripts/ops` → **Apps** does all of this from the menu.
+
+#### Your own website or SaaS, from Git (Kontor, or anything with a Dockerfile + compose file)
 
 ```bash
-# Kontor (its own compose files; the shared Caddy replaces its built-in front doors)
-cd /srv/apps && git clone <your-kontor-repo> kontor && cd kontor
-cp .env.example .env && chmod 600 .env
-#   in .env: COMPOSE_FILE=docker-compose.prod.yml and COMPOSE_PROFILES=  (empty)
-ops-app adopt kontor --port 8080      # sets KONTOR_HOSTNAME=kontor.home.internal
-ops-app up kontor --build             # https://kontor.home.internal
+sudo ops-app deploy kontor git@github.com:owlendev/Kontor.git
+```
 
+One command, safe to re-run. It:
+
+1. **gets the code**. For a private repo (SSH URL), it makes a read-only **deploy key** for that one repo, prints it, and says where to add it (GitHub/GitLab/Gitea → repo → Settings → Deploy keys). Add it, then run the same command again.
+2. **makes `.env` from `.env.example`** (root-only, never committed):
+   - hostname and URL settings (`*_HOSTNAME`, `*_DOMAIN`, `*ALLOWED_HOSTS*`, `APP_URL`, `BASE_URL`...) get `https://<name>.home.internal`, replacing `localhost`;
+   - empty internal secrets (`SECRET_KEY`, `*_PASSWORD`, `JWT_SECRET`...) get random values;
+   - keys from other services (`SMTP_*`, `STRIPE_*`, `AWS_*`...) are left for you, and every setting still empty is listed with its comment from `.env.example`;
+   - compose profiles that only add the app's own front door (Kontor's `tailscale`/`caddy`/`cloudflare`) are turned off, since the shared Caddy does that job.
+3. **puts it behind Caddy**: picks the web service and joins it to the proxy network. It also warns about published ports.
+4. **builds and starts it**, and finds the port (compose file, then Dockerfile `EXPOSE`).
+5. **checks it answers** at `https://<name>.home.internal`. If not, it shows the last log lines and what to try.
+
+Then, for its whole life:
+
+```bash
+sudo ops-app update kontor      # backs up, pulls, rebuilds, checks it answers; says how to undo if not
+sudo ops-app rollback kontor    # back to the version before the last update
+sudo ops-app env kontor         # its settings (secrets hidden), and what's still empty
+sudo ops-app backup kontor      # now (nightly backups run on their own, see below)
+sudo ops-app backups            # list them
+sudo ops-app restore kontor <file> --yes   # makes a backup of now first, so it can be undone
+```
+
+**Backups:** every night (`APPS_BACKUP_TIME`, default 03:30), each app is stopped for a few seconds while its data volumes and its files that aren't in Git (`.env`, data folders) are copied to `/srv/backups/<app>/`. Caddy's certificate authority is included too. The newest 7 are kept. They hold secrets, so they're root-only. Proxmox backups of the VM give you the off-site copy. Kontor's own encrypted backups (Settings → Backups) stay your main backup for Kontor; these are a second layer that covers every app the same way.
+
+#### Ready-made apps and images
+
+```bash
 # Nextcloud, from a ready-made template (Postgres + Redis + cron, passwords generated)
 ops-app new nextcloud --template nextcloud
 ops-app up nextcloud                  # https://nextcloud.home.internal (admin password: /srv/apps/nextcloud/.env)
@@ -715,6 +741,8 @@ All variables are in `config/default.env`. The main ones:
 | `PROXY_CF_API_TOKEN` / `PROXY_ACME_EMAIL` | empty | For `cloudflare` only. The token is a **secret** |
 | `PROXY_ALLOW_FROM` | `private_ranges 100.64.0.0/10` | Who Caddy answers (LAN + Tailscale); others get 403 |
 | `PROXY_SUBNET` | `172.30.0.0/24` | Subnet of the `proxy` network; change if it clashes with your LAN |
+| `APPS_BACKUP` / `APPS_BACKUP_TIME` | `yes` / `03:30` | Nightly backup of every app (data volumes + `.env`) and Caddy's CA |
+| `APPS_BACKUP_KEEP` / `APPS_BACKUP_DIR` | `7` / `/srv/backups` | How many to keep per app, and where |
 | `ADGUARD_REWRITES` | empty | Local names, e.g. `"*.home.internal=192.168.1.50"` |
 | `ADGUARD_USER` / `ADGUARD_PASSWORD` | `admin` / generated | Web UI login. The password is a **secret**; generated ones go to `/root/adguard-admin.txt` |
 | `ADGUARD_UPSTREAMS` | empty | Upstream DNS servers (default: AdGuard's Quad9 over HTTPS) |

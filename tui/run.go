@@ -225,7 +225,7 @@ func styleLine(l string) string {
 	switch {
 	case strings.HasPrefix(plain, "==>"):
 		return sAcc.Bold(true).Render(plain)
-	case strings.Contains(plain, "] OK") || strings.HasPrefix(strings.TrimSpace(plain), "PASS"):
+	case strings.Contains(plain, "] OK") || strings.HasPrefix(strings.TrimSpace(plain), "PASS") || strings.HasPrefix(plain, "OK "):
 		return sGreen.Render(plain)
 	case strings.Contains(plain, "] WARN") || strings.HasPrefix(strings.TrimSpace(plain), "WARN"):
 		return sYel.Render(plain)

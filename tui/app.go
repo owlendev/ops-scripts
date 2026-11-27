@@ -124,6 +124,9 @@ func newHome(a *app) *home {
 			menuItem{"pve-list", "Machines", "What ops made on this Proxmox, and how to log in to each"})
 		setupDesc = "Set up THIS Proxmox host itself (for new LXCs/VMs use New machine)"
 	}
+	if hasOpsApp() {
+		items = append(items, menuItem{"apps", "Apps", "Deploy your website/SaaS from Git, update, back up (ops-app)"})
+	}
 	return &home{app: a, items: append(items, []menuItem{
 		{"setup", "Guided setup", setupDesc},
 		{"audit", "Audit & fix", "Check security and health, then fix problems with Enter"},
@@ -180,6 +183,8 @@ func (p *home) open(key string) tea.Cmd {
 		return push(pp)
 	case "pve-list":
 		return push(newPveMachines(r))
+	case "apps":
+		return push(newAppsPage())
 	}
 	return tea.Quit
 }

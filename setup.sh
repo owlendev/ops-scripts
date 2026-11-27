@@ -129,6 +129,9 @@ APPS_DOMAIN|Apps domain|Apps get https://<name>.<this>, e.g. home.internal.|app-
 PROXY_TLS|Certificates|internal = Caddy's own CA (trust once per device), cloudflare = real certificates (needs a domain on Cloudflare).|app-proxy
 PROXY_CF_API_TOKEN|Cloudflare token|Only for cloudflare: API token with Zone.DNS edit. Never written to saved config files.|app-proxy
 PROXY_ACME_EMAIL|LE email|Only for cloudflare: Let's Encrypt expiry notices.|app-proxy
+APPS_BACKUP|Nightly backups|yes = back up every app (data volumes + .env) each night into /srv/backups.|app-proxy
+APPS_BACKUP_TIME|Backup time|HH:MM, e.g. 03:30. Apps stop for a moment while their data is copied.|app-proxy
+APPS_BACKUP_KEEP|Backups kept|How many backups to keep per app, e.g. 7.|app-proxy
 ADGUARD_REWRITES|Local names|Space separated name=ip, e.g. *.home.internal=192.168.1.50 (the apps VM).|adguard
 ADGUARD_PASSWORD|AdGuard password|Empty = generated and saved to /root/adguard-admin.txt. Never written to saved config files.|adguard
 REBOOT_IF_REQUIRED|Reboot at end|yes = reboot after setup if updates need it.|"

@@ -10,9 +10,13 @@ set -euo pipefail
 CONF="${OPS_APP_CONF:-/etc/ops-app.env}"
 [[ -r "$CONF" ]] || { echo "ops-app: $CONF missing. Run the app-proxy module first." >&2; exit 1; }
 # shellcheck disable=SC1090
-. "$CONF"   # APPS_DIR APPS_DOMAIN PROXY_SUBNET TEMPLATES_DIR
+. "$CONF"   # APPS_DIR APPS_DOMAIN PROXY_SUBNET TEMPLATES_DIR APPS_BACKUP_DIR APPS_BACKUP_KEEP
 PROXY="$APPS_DIR/_proxy"
 SITES="$PROXY/conf/sites"
+KEYS="$APPS_DIR/.keys"      # deploy keys for private Git repos (root only)
+META="$APPS_DIR/.meta"      # per-app facts: where its code comes from, last good commit
+BACKUPS="${APPS_BACKUP_DIR:-/srv/backups}"
+KEEP="${APPS_BACKUP_KEEP:-7}"
 
 if [[ -t 1 ]]; then R=$'\033[31m' G=$'\033[32m' Y=$'\033[33m' B=$'\033[1m' D=$'\033[2m' N=$'\033[0m'
 else R='' G='' Y='' B='' D='' N=''; fi
@@ -21,6 +25,12 @@ warn() { printf '%sWARN%s %s\n' "$Y" "$N" "$*" >&2; }
 bad()  { printf '%sFAIL%s %s\n' "$R" "$N" "$*" >&2; }
 die()  { bad "$*"; exit 1; }
 info() { printf '     %s\n' "$*"; }
+# fail WHAT FIX: stop, saying what went wrong and what to do about it.
+fail() { bad "$1"; printf '%s     How to fix:%s %s\n' "$Y" "$N" "$2" >&2; exit 1; }
+hint() { printf '%s     How to fix:%s %s\n' "$Y" "$N" "$*" >&2; }
+# step TITLE: a stage of a longer job (the ops UI shows these as progress).
+step() { printf '\n%s==> Step: %s%s\n' "$B" "$1" "$N"; }
+need_root() { [[ "$(id -u)" -eq 0 || -n "${OPS_APP_TEST:-}" ]] || fail "'ops-app $1' needs root (it reads deploy keys and backups)" "Run: sudo ops-app $*"; }
 
 usage() {
   cat <<EOF
@@ -34,6 +44,19 @@ ${B}Add an app${N}
                                                  (e.g. Kontor: ops-app adopt kontor --port 8080)
   ops-app route <name> <address> [--insecure]    a name for something outside Docker, e.g.
                                                  ops-app route proxmox https://192.168.1.10:8006 --insecure
+
+${B}Deploy your own app from Git${N} (a website, a SaaS, Kontor...)
+  ops-app deploy <name> <git-url> [--branch B] [--port N] [--service S]
+                                                 clone, make .env from .env.example, build, put
+                                                 behind Caddy, and check it answers. Safe to re-run.
+  ops-app update <name>                          back up, pull the new code, rebuild, check it answers
+  ops-app rollback <name>                        go back to the version before the last update
+  ops-app env <name>                             what's set in its .env, and what's still empty
+
+${B}Backups${N} (nightly by default, kept $KEEP days, in $BACKUPS)
+  ops-app backup <name>|--all [--live]           data volumes + .env + files; stops the app briefly
+  ops-app backups [<name>]                       list backups
+  ops-app restore <name> <file> --yes            put a backup back (makes a backup of now first)
 
 ${B}Run${N}
   ops-app up|down|restart|pull|ps|logs <name>    docker compose in the app's folder
@@ -235,13 +258,8 @@ cmd_adopt() {
     info "empty: the shared Caddy is the front door now, and two would fight over ports 80/443."
   fi
 
-  # Kontor answers only for its own hostname.
-  if grep -qE '^KONTOR_HOSTNAME=$' "$env"; then
-    sed -i -E "s|^KONTOR_HOSTNAME=$|KONTOR_HOSTNAME=$(host_of "$name")|" "$env"
-    info "Set KONTOR_HOSTNAME=$(host_of "$name") in $env"
-  elif grep -qE '^KONTOR_HOSTNAME=' "$env" && ! grep -qxF "KONTOR_HOSTNAME=$(host_of "$name")" "$env"; then
-    warn "KONTOR_HOSTNAME in $env isn't $(host_of "$name"); Kontor will refuse requests for that name."
-  fi
+  # Apps that check their own hostname (Kontor's KONTOR_HOSTNAME, APP_URL...) get theirs.
+  [[ -f "$env" ]] && fill_env "$env" "$name" host-only
 
   services="$(compose "$d" config --services 2>/dev/null)" || die "docker compose can't read $d. Fix its .env first: cd $d && docker compose config"
   if [[ -z "$svc" ]]; then
@@ -407,6 +425,495 @@ cmd_doctor() {
   return "$fails"
 }
 
+# =============================================================================
+# Deploying your own apps from Git: websites, SaaS, Kontor...
+# =============================================================================
+
+is_ssh_url() { [[ "$1" =~ ^ssh:// || "$1" =~ ^[A-Za-z0-9._-]+@[^:/]+: ]]; }
+meta_file() { echo "$META/$1.env"; }
+meta_get() { [[ -f "$(meta_file "$1")" ]] && sed -n "s/^$2=//p" "$(meta_file "$1")" | tail -1 || true; }
+meta_set() { # name key value
+  install -d -m 700 "$META"
+  local f; f="$(meta_file "$1")"; touch "$f"; chmod 600 "$f"
+  sed -i "/^$2=/d" "$f"; printf '%s=%s\n' "$2" "$3" >> "$f"
+}
+# git for an app, with its deploy key if it has one.
+app_git() { # name args...
+  local name="$1"; shift
+  local key="$KEYS/$name"
+  if [[ -f "$key" ]]; then
+    GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KEYS/known_hosts" \
+      git -C "$APPS_DIR/$name" "$@"
+  else
+    git -C "$APPS_DIR/$name" "$@"
+  fi
+}
+
+# What kind of setting is this .env name? host | url | secret | "" (leave alone)
+env_kind() {
+  local k="$1"
+  case "$k" in
+    *ALLOWED_HOSTS*) echo host; return ;;
+    *_HOSTNAME|HOSTNAME|*_DOMAIN|DOMAIN|SERVER_NAME|VIRTUAL_HOST) echo host; return ;;
+    APP_URL|BASE_URL|PUBLIC_URL|SITE_URL|ROOT_URL|ORIGIN|NEXTAUTH_URL|*_PUBLIC_URL|*_BASE_URL|*_APP_URL|*_SITE_URL) echo url; return ;;
+  esac
+  # Keys from other services (mail, payments, cloud...) can't be made up: leave those.
+  [[ "$k" =~ ^(SMTP|MAIL|EMAIL|AWS|S3|R2|B2|MINIO|STRIPE|PAYPAL|GITHUB|GITLAB|GOOGLE|OPENAI|ANTHROPIC|TS|TAILSCALE|CLOUDFLARE|CF|SENTRY|TWILIO|SENDGRID|MAILGUN|POSTMARK|RESEND|SLACK|DISCORD|FIREBASE|SUPABASE|OAUTH|AUTH0|CLERK)_ ]] && return 0
+  [[ "$k" =~ (PASSWORD|PASSWD|_SECRET$|^SECRET|SECRET_KEY$|_SALT$|^APP_KEY$|ENCRYPTION_KEY|SIGNING_KEY|JWT_SECRET|SESSION_SECRET|COOKIE_SECRET) ]] && echo secret
+  return 0
+}
+
+# fill_env FILE NAME [host-only]: give empty hostname/URL settings this app's name,
+# replace localhost URLs, and (unless host-only) generate empty internal secrets.
+fill_env() {
+  local f="$1" name="$2" mode="${3:-}" host tmp line k v kind filled=() made=() sq="'"
+  host="$(host_of "$name")"
+  tmp="$(mktemp)"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
+      v="${v%\"}"; v="${v#\"}"; v="${v%"$sq"}"; v="${v#"$sq"}"
+      kind="$(env_kind "$k")"
+      if [[ "$kind" == host && ( -z "$v" || "$v" =~ (localhost|127\.0\.0\.1|example\.(com|org)) ) && "$v" != "$host" ]]; then
+        if [[ "$k" == *ALLOWED_HOSTS* && -n "$v" ]]; then line="$k=$v,$host"; else line="$k=$host"; fi
+        filled+=("$k")
+      elif [[ "$kind" == url && ( -z "$v" || "$v" =~ (localhost|127\.0\.0\.1|example\.(com|org)) ) ]]; then
+        line="$k=https://$host"; filled+=("$k")
+      elif [[ "$kind" == secret && -z "$v" && "$mode" != host-only ]]; then
+        line="$k=$(gen_secret)"; made+=("$k")
+      fi
+    fi
+    printf '%s\n' "$line" >> "$tmp"
+  done < "$f"
+  cat "$tmp" > "$f"; rm -f "$tmp"; chmod 600 "$f"
+  [[ ${#filled[@]} -gt 0 ]] && ok "Set to this app's address ($host): ${filled[*]}"
+  [[ ${#made[@]} -gt 0 ]] && ok "Generated random secrets: ${made[*]}" &&
+    info "(If one of these is actually a key from another service, replace it in $f.)"
+  return 0
+}
+
+# Settings in .env that are still empty, each with its explanation from the example.
+env_empty_report() { # env example
+  local env="$1" ex="${2:-}" k
+  local empty; empty="$(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=$' "$env" | tr -d '=' | grep -v '^COMPOSE_' || true)"
+  [[ -z "$empty" ]] && { ok "No empty settings left in .env"; return 0; }
+  warn "Still empty in $env (fine if the app doesn't need them; fill in the ones it does):"
+  for k in $empty; do
+    local c=""
+    [[ -n "$ex" ]] && c="$(awk -v k="$k" '/^#/ { buf = buf ? buf " " substr($0, 2) : substr($0, 2); next }
+      $0 ~ "^" k "=" { print buf; exit } { buf = "" }' "$ex" | sed 's/^ *//' | cut -c1-110)"
+    printf '       %-26s %s\n' "$k" "${D}${c}${N}"
+  done
+}
+
+# Drop compose profiles that only add the app's own front door (caddy, traefik,
+# nginx, tailscale, cloudflared): the shared Caddy is the front door here.
+prune_frontdoor() { # dir
+  local d="$1" env="$1/.env" profiles json keep=() p
+  profiles="$(grep -E '^COMPOSE_PROFILES=' "$env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'" || true)"
+  [[ -n "$profiles" ]] || return 0
+  command -v jq >/dev/null || { warn "COMPOSE_PROFILES=$profiles left as is (install jq to check them)"; return 0; }
+  json="$(compose "$d" config --format json 2>/dev/null)" || return 0
+  for p in ${profiles//,/ }; do
+    if jq -e --arg p "$p" '[.services[] | select((.profiles // []) | index($p))]
+         | length > 0 and all(.image // "" | test("(^|/)(caddy|traefik|nginx|nginx-proxy|haproxy|tailscale|cloudflared)(:|@|$)"))' \
+         <<< "$json" >/dev/null; then
+      info "Profile '$p' only adds the app's own front door: turned off (the shared Caddy does that job)"
+    else
+      keep+=("$p")
+    fi
+  done
+  local new; new="$(IFS=,; echo "${keep[*]}")"
+  [[ "$new" == "$profiles" ]] || sed -i -E "s|^COMPOSE_PROFILES=.*|COMPOSE_PROFILES=$new|" "$env"
+}
+
+# Which service gets the web traffic.
+pick_service() { # dir name [service]
+  local d="$1" name="$2" svc="${3:-}" services
+  services="$(compose "$d" config --services 2>/dev/null)" ||
+    fail "docker compose can't read $d" "See why: cd $d && docker compose config"
+  if [[ -z "$svc" ]]; then
+    if [[ "$(wc -l <<< "$services")" -eq 1 ]]; then svc="$services"
+    elif grep -qxE "$name|web|app|frontend|server" <<< "$services"; then
+      svc="$(grep -m1 -xE "$name|web|app|frontend|server" <<< "$services")"
+    else fail "Which service serves the website? It has: $(tr '\n' ' ' <<< "$services")" "Run again with --service <one of them>"; fi
+  fi
+  grep -qx "$svc" <<< "$services" || fail "No service '$svc' in $d" "Pick one of: $(tr '\n' ' ' <<< "$services")"
+  echo "$svc"
+}
+
+# The port the service listens on inside its container: compose expose/ports,
+# then the Dockerfile's EXPOSE, then the built image.
+detect_port() { # dir service
+  local d="$1" svc="$2" json p ctx df img
+  json="$(compose "$d" config --format json 2>/dev/null)" || return 0
+  p="$(jq -r --arg s "$svc" '.services[$s] | ((.expose // [])[0] // ((.ports // [])[0].target) // empty)' <<< "$json")"
+  if [[ -z "$p" ]]; then
+    ctx="$(jq -r --arg s "$svc" '.services[$s].build.context // empty' <<< "$json")"
+    df="$(jq -r --arg s "$svc" '.services[$s].build.dockerfile // "Dockerfile"' <<< "$json")"
+    [[ "$df" == /* ]] || df="$ctx/$df"
+    [[ -n "$ctx" && -f "$df" ]] && p="$(grep -iE '^\s*EXPOSE\s+[0-9]+' "$df" | head -1 | grep -oE '[0-9]+' | head -1 || true)"
+  fi
+  if [[ -z "$p" ]]; then
+    img="$(jq -r --arg s "$svc" '.services[$s].image // empty' <<< "$json")"
+    [[ -n "$img" ]] && p="$(docker image inspect "$img" -f '{{range $k, $v := .Config.ExposedPorts}}{{$k}} {{end}}' 2>/dev/null | grep -oE '^[0-9]+' || true)"
+  fi
+  echo "${p%%/*}"
+}
+
+# Does the app answer through Caddy? (Any HTTP answer below 500 counts: a login page,
+# a redirect or a 404 all mean the app is up.)
+check_app() { # name port
+  local name="$1" port="$2" host code=000 i
+  host="$(host_of "$name")"
+  for i in $(seq 1 45); do
+    docker exec caddy nc -z -w 2 "$name" "$port" >/dev/null 2>&1 && break
+    (( i == 45 )) && { bad "Nothing listens on $name:$port after 90 seconds"; return 1; }
+    sleep 2
+  done
+  for i in $(seq 1 15); do
+    code="$(curl -sk --max-time 10 --resolve "$host:${OPS_APP_HTTPS_PORT:-443}:127.0.0.1" -o /dev/null \
+      -w '%{http_code}' "https://$host:${OPS_APP_HTTPS_PORT:-443}/" || true)"
+    [[ "$code" =~ ^[1-4][0-9][0-9]$ ]] && break
+    sleep 2
+  done
+  if [[ "$code" =~ ^[1-4][0-9][0-9]$ ]]; then ok "https://$host answers (HTTP $code)"; return 0; fi
+  bad "https://$host doesn't answer properly (HTTP $code)"
+  return 1
+}
+
+show_logs_hint() { # dir
+  info "Last lines of its logs:"
+  compose "$1" logs --tail 15 2>&1 | sed 's/^/       /' || true
+}
+
+cmd_deploy() {
+  local name="${1:-}" url="${2:-}" branch="" port="" svc=""
+  [[ -n "$name" && -n "$url" ]] ||
+    fail "Usage: ops-app deploy <name> <git-url> [--branch B] [--port N] [--service S]" "e.g. sudo ops-app deploy kontor git@github.com:you/kontor.git"
+  shift 2
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --branch) branch="${2:-}"; shift 2 ;;
+      --port) port="${2:-}"; shift 2 ;;
+      --service) svc="${2:-}"; shift 2 ;;
+      *) fail "Unknown option $1" "See: ops-app help" ;;
+    esac
+  done
+  valid_name "$name"; need_root deploy "$name" "$url"; need_docker
+  command -v git >/dev/null || fail "git isn't installed" "sudo apt install git"
+  local d="$APPS_DIR/$name"
+
+  step "Get the code"
+  if [[ -d "$d/.git" ]]; then
+    ok "Already cloned in $d (keeping it; new code comes with: ops-app update $name)"
+  else
+    [[ -e "$d" && -n "$(ls -A "$d" 2>/dev/null)" ]] &&
+      fail "$d exists and isn't a Git checkout" "Move it away, or use 'ops-app adopt $name' for a folder you manage yourself"
+    if is_ssh_url "$url"; then
+      install -d -m 700 "$KEYS"
+      if [[ ! -f "$KEYS/$name" ]]; then
+        ssh-keygen -q -t ed25519 -N '' -C "ops-app deploy key: $name on $(hostname)" -f "$KEYS/$name"
+        info "Made a deploy key for $name: it lets this machine read that one repository, nothing else."
+      fi
+      local out
+      mkdir -p "$d"
+      if ! out="$(app_git "$name" ls-remote "$url" HEAD 2>&1)"; then
+        rmdir "$d" 2>/dev/null || true
+        if grep -qiE 'permission denied|not found|could not read|access denied|not authorized' <<< "$out"; then
+          bad "This machine can't read $url yet"
+          info "Add this key to that repository as a read-only deploy key:"
+          echo; cat "$KEYS/$name.pub"; echo
+          info "GitHub: the repo → Settings → Deploy keys → Add deploy key → paste it, leave 'Allow write access' off."
+          info "GitLab: the repo → Settings → Repository → Deploy keys.   Gitea/Forgejo: the repo → Settings → Deploy keys."
+          hint "Add it, then run the same command again:  sudo ops-app deploy $name $url"
+          exit 1
+        fi
+        fail "Can't reach $url: $(tail -1 <<< "$out")" "Check the URL and that this machine reaches the Git server (e.g. ssh -T git@github.com)"
+      fi
+      rmdir "$d" 2>/dev/null || true
+    fi
+    local cl=(clone --quiet); [[ -n "$branch" ]] && cl+=(--branch "$branch")
+    if [[ -f "$KEYS/$name" ]]; then
+      GIT_SSH_COMMAND="ssh -i $KEYS/$name -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KEYS/known_hosts" \
+        git "${cl[@]}" "$url" "$d" || fail "git clone failed (see above)" "Check the URL and branch, then run again"
+    else
+      git "${cl[@]}" "$url" "$d" ||
+        fail "git clone failed (see above)" "For a private repo, use its SSH URL (git@github.com:you/app.git): ops-app then makes a deploy key for it"
+    fi
+    ok "Cloned $url into $d"
+  fi
+  branch="${branch:-$(app_git "$name" rev-parse --abbrev-ref HEAD)}"
+  meta_set "$name" GIT_URL "$url"; meta_set "$name" BRANCH "$branch"
+  # Never let .env be committed from here, even if the repo forgot to ignore it.
+  app_git "$name" check-ignore -q .env 2>/dev/null || {
+    echo ".env" >> "$d/.git/info/exclude"; warn "The repo doesn't git-ignore .env; ignored here locally. Add .env to its .gitignore."; }
+  echo "compose.proxy.yml" >> "$d/.git/info/exclude"; sort -u -o "$d/.git/info/exclude" "$d/.git/info/exclude"
+
+  step "Settings (.env)"
+  local ex=""
+  for f in .env.example .env.sample env.example .env.dist; do [[ -f "$d/$f" ]] && { ex="$d/$f"; break; }; done
+  if [[ -f "$d/.env" ]]; then
+    ok ".env exists: keeping your values (only empty or localhost addresses get this app's)"
+    fill_env "$d/.env" "$name" host-only
+  elif [[ -n "$ex" ]]; then
+    cp "$ex" "$d/.env"; chmod 600 "$d/.env"
+    ok "Made .env from $(basename "$ex") (private: only root can read it)"
+    fill_env "$d/.env" "$name"
+  else
+    : > "$d/.env"; chmod 600 "$d/.env"
+    info "The repo has no .env.example: starting with an empty .env"
+  fi
+  prune_frontdoor "$d"
+  local cout
+  if ! cout="$(compose "$d" config -q 2>&1)"; then
+    local var; var="$(grep -oE 'required variable [A-Za-z_0-9]+' <<< "$cout" | awk '{print $3}' | head -1 || true)"
+    [[ -n "$var" ]] && fail "The app needs $var: $(grep -oE 'is missing a value.*' <<< "$cout" | head -1)" \
+      "Set $var in $d/.env (see its comment in ${ex:-the app docs}), then run the same deploy command again"
+    fail "docker compose rejects the settings: $(tail -1 <<< "$cout")" "Fix $d/.env (or the compose file), then run the same command again"
+  fi
+  env_empty_report "$d/.env" "$ex"
+
+  step "Put it behind Caddy"
+  svc="$(pick_service "$d" "$name" "$svc")"
+  write_overlay "$d" "$svc" "$name"
+  link_overlay "$d"
+  warn_published_ports "$d"
+  ok "Service '$svc' joins the proxy network as '$name'"
+  meta_set "$name" SERVICE "$svc"
+
+  step "Build and start"
+  info "Building can take a few minutes the first time; later builds reuse what didn't change."
+  compose "$d" up -d --build --remove-orphans ||
+    fail "Building or starting failed (the error is just above)" "Fix it in the code or in $d/.env, then run the same deploy command again (it's safe to re-run)"
+  if [[ -z "$port" ]]; then
+    port="$(detect_port "$d" "$svc")"
+    [[ -n "$port" ]] || fail "Couldn't tell which port '$svc' listens on" "Run again with --port N: the port inside the container (often 3000, 8000 or 8080)"
+    info "It listens on port $port (from its compose file / Dockerfile)"
+  fi
+  meta_set "$name" PORT "$port"
+  write_route "$name" "$name:$port" 0
+
+  step "Check it answers"
+  if ! check_app "$name" "$port"; then
+    show_logs_hint "$d"
+    fail "It's running, but doesn't answer on port $port" "Check the logs above (ops-app logs $name). Wrong port? Run again with --port N. Settings missing? ops-app env $name"
+  fi
+  meta_set "$name" GOOD_COMMIT "$(app_git "$name" rev-parse HEAD)"
+
+  step "Done"
+  ok "$name is live at https://$(host_of "$name")"
+  info "Update it later:  sudo ops-app update $name   (backs up first, and checks the new version answers)"
+  info "Its settings:     sudo ops-app env $name      (file: $d/.env)"
+  info "Backups:          nightly into $BACKUPS/$name; now: sudo ops-app backup $name"
+}
+
+cmd_env() {
+  local name="${1:-}" d f ex=""
+  [[ -n "$name" ]] || fail "Usage: ops-app env <name>" "e.g. sudo ops-app env kontor"
+  need_root env "$name"
+  d="$APPS_DIR/$name"; f="$d/.env"
+  [[ -f "$f" ]] || fail "$name has no .env" "Deploy it first: sudo ops-app deploy $name <git-url>"
+  for e in .env.example .env.sample env.example .env.dist; do [[ -f "$d/$e" ]] && { ex="$d/$e"; break; }; done
+  printf '%sSettings in %s%s (secrets hidden)\n' "$B" "$f" "$N"
+  grep -E '^[A-Za-z_][A-Za-z0-9_]*=.' "$f" | while IFS='=' read -r k v; do
+    if [[ "$(env_kind "$k")" == secret || "$k" =~ (KEY|TOKEN|SECRET|PASSWORD) ]]; then v="•••••• (${#v} characters)"; fi
+    printf '  %-28s %s\n' "$k" "$v"
+  done
+  echo
+  env_empty_report "$f" "$ex"
+  info "Change a value: sudo nano $f   then apply it: ops-app up $name"
+}
+
+cmd_update() {
+  local name="${1:-}" nobackup=0 force=0 d url branch svc port file=""
+  [[ -n "$name" ]] || fail "Usage: ops-app update <name> [--no-backup] [--rebuild]" "e.g. sudo ops-app update kontor"
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in --no-backup) nobackup=1 ;; --rebuild) force=1 ;; *) fail "Unknown option $1" "See: ops-app help" ;; esac; shift
+  done
+  need_root update "$name"; need_docker
+  d="$APPS_DIR/$name"; url="$(meta_get "$name" GIT_URL)"; branch="$(meta_get "$name" BRANCH)"
+  svc="$(meta_get "$name" SERVICE)"; port="$(meta_get "$name" PORT)"
+  [[ -n "$url" && -d "$d/.git" ]] ||
+    fail "$name wasn't deployed from Git by ops-app" "For apps from an image: ops-app pull $name. To switch to Git: sudo ops-app deploy $name <git-url>"
+
+  step "Check for new code"
+  app_git "$name" fetch --quiet origin || fail "Couldn't fetch from $url" "Check the network, and that the deploy key is still on the repo"
+  if [[ -n "$(app_git "$name" status --porcelain --untracked-files=no)" ]]; then
+    fail "Files in $d were changed by hand, so updating could lose them" "See what changed: git -C $d status. Put such changes in the repo instead, or drop them: git -C $d checkout -- ."
+  fi
+  # After a rollback the code is on an older commit: going back to the branch is
+  # itself a change that needs a rebuild.
+  local was; was="$(app_git "$name" rev-parse HEAD)"
+  app_git "$name" checkout --quiet "$branch" 2>/dev/null || true
+  [[ "$(app_git "$name" rev-parse HEAD)" != "$was" ]] && { force=1; info "Leaving the rolled-back version, back to the latest $branch"; }
+  local behind; behind="$(app_git "$name" rev-list --count "HEAD..origin/$branch")"
+  if (( behind == 0 && ! force )); then ok "Already up to date ($(app_git "$name" log -1 --format='%h %s'))"; return 0; fi
+  if (( behind > 0 )); then
+    info "$behind new commit(s) on $branch:"
+    app_git "$name" log --oneline "HEAD..origin/$branch" | head -15 | sed 's/^/       /'
+  fi
+
+  if (( ! nobackup )); then
+    step "Back up first"
+    info "An undo point, in case the new version changes the data in a way you want to reverse."
+    backup_one "$name" 0 || fail "The backup failed, so nothing was updated" "Fix the reason above, or update without a backup: sudo ops-app update $name --no-backup"
+    file="$LAST_BACKUP"
+  fi
+
+  step "Get the new code"
+  meta_set "$name" PREV_COMMIT "$(app_git "$name" rev-parse HEAD)"
+  app_git "$name" merge --quiet --ff-only "origin/$branch" ||
+    fail "Couldn't move to the new code (the branch history was rewritten?)" "Look: git -C $d log --oneline -3 origin/$branch. To take the remote as is: git -C $d reset --hard origin/$branch, then update again"
+  ok "Now at $(app_git "$name" log -1 --format='%h %s')"
+
+  step "Rebuild and restart"
+  compose "$d" up -d --build --remove-orphans ||
+    fail "The new version didn't build or start (the error is above)" "If the build failed, the old containers may still be running. Go back to the previous code: sudo ops-app rollback $name"
+
+  step "Check it answers"
+  if ! check_app "$name" "${port:-80}"; then
+    show_logs_hint "$d"
+    fail "The new version doesn't answer" "Go back: sudo ops-app rollback $name.${file:+ If it changed the data on start, also: sudo ops-app restore $name $file --yes}"
+  fi
+  meta_set "$name" GOOD_COMMIT "$(app_git "$name" rev-parse HEAD)"
+  ok "$name updated"
+}
+
+cmd_rollback() {
+  local name="${1:-}" d prev port
+  [[ -n "$name" ]] || fail "Usage: ops-app rollback <name>" "e.g. sudo ops-app rollback kontor"
+  need_root rollback "$name"; need_docker
+  d="$APPS_DIR/$name"; prev="$(meta_get "$name" PREV_COMMIT)"; port="$(meta_get "$name" PORT)"
+  [[ -n "$prev" ]] || fail "No earlier version recorded for $name" "Rollback works after an 'ops-app update'"
+  step "Go back to $(app_git "$name" log -1 --format='%h %s' "$prev")"
+  app_git "$name" checkout --quiet --detach "$prev" || fail "Couldn't switch the code back" "Look: git -C $d status"
+  compose "$d" up -d --build --remove-orphans || fail "The previous version didn't build or start" "See the error above"
+  check_app "$name" "${port:-80}" || { show_logs_hint "$d"; fail "The previous version doesn't answer either" "Restore a backup from before the update: sudo ops-app backups $name"; }
+  ok "$name is back on $(app_git "$name" log -1 --format='%h %s')"
+  warn "If the newer version changed the database on start, the old one may not understand it."
+  hint "If anything looks wrong, restore the backup made before the update: sudo ops-app backups $name"
+  info "The next 'ops-app update $name' goes to the latest $(meta_get "$name" BRANCH) again."
+}
+
+# --- Backups -------------------------------------------------------------------
+
+# A small image with tar, already on this machine: Caddy's.
+helper_image() { docker inspect -f '{{.Config.Image}}' caddy 2>/dev/null || echo "caddy:2.11.6"; }
+app_dirs() { local d; for d in "$APPS_DIR"/*/; do d="${d%/}"; [[ "$(basename "$d")" == [_.]* ]] && continue; [[ -f "$d/compose.yml" || -f "$d/compose.yaml" || -f "$d/docker-compose.yml" || -f "$d/docker-compose.yaml" ]] && basename "$d"; done; }
+LAST_BACKUP=""
+
+# backup_one NAME LIVE(0|1): data volumes + the app's own files that aren't in Git
+# (.env, data folders). The app is stopped meanwhile unless LIVE, so databases are
+# copied in a consistent state.
+backup_one() {
+  local name="$1" live="$2" d="$APPS_DIR/$1" proj vols out ts tmp img stopped=0 v
+  [[ -d "$d" ]] || { bad "No app $name"; return 1; }
+  proj="$(compose "$d" config --format json 2>/dev/null | jq -r '.name // empty')"
+  [[ -n "$proj" ]] || { bad "$name: docker compose can't read its folder"; return 1; }
+  vols="$(docker volume ls -q --filter "label=com.docker.compose.project=$proj")"
+  out="$BACKUPS/$name"; install -d -m 700 "$BACKUPS" "$out"
+  ts="$(date +%Y%m%d-%H%M%S)"; tmp="$(mktemp -d -p "$BACKUPS" .tmp.XXXX)"; img="$(helper_image)"
+  if (( ! live )) && [[ -n "$(compose "$d" ps -q --status running 2>/dev/null)" ]]; then
+    info "Stopping $name for a moment, so its data is copied in a consistent state"
+    compose "$d" stop >/dev/null 2>&1 && stopped=1
+  fi
+  local rc=0
+  for v in $vols; do
+    docker run --rm -v "$v:/v:ro" -v "$tmp:/out" --entrypoint tar "$img" -C /v -cf "/out/vol-$v.tar" . || { bad "Couldn't copy volume $v"; rc=1; }
+  done
+  if [[ -d "$d/.git" ]]; then
+    # Only what Git doesn't have: .env, compose.proxy.yml, data folders...
+    { git -C "$d" ls-files -z --others --exclude-standard; git -C "$d" ls-files -z --others --ignored --exclude-standard; } |
+      tr '\0' '\n' | grep -vE '(^|/)node_modules/' | sort -u | tr '\n' '\0' |
+      tar -C "$d" --null -T - -cf "$tmp/files.tar" 2>/dev/null || true
+  else
+    tar -C "$d" --exclude=node_modules -cf "$tmp/files.tar" . || rc=1
+  fi
+  (( stopped )) && { compose "$d" start >/dev/null 2>&1 || bad "$name didn't start again: ops-app up $name"; }
+  {
+    echo "app=$name"; echo "date=$(date -Is)"; echo "host=$(hostname)"
+    [[ -d "$d/.git" ]] && echo "commit=$(git -C "$d" rev-parse HEAD)"
+    echo "volumes=$(tr '\n' ' ' <<< "$vols")"
+  } > "$tmp/backup.txt"
+  if (( rc )); then rm -rf "$tmp"; return 1; fi
+  LAST_BACKUP="$out/$name-$ts.tar.gz"
+  tar -C "$tmp" -czf "$LAST_BACKUP" . && chmod 600 "$LAST_BACKUP"; rm -rf "$tmp"
+  # Keep the newest $KEEP.
+  ls -1t "$out/$name"-*.tar.gz 2>/dev/null | tail -n +"$((KEEP + 1))" | xargs -r rm -f
+  ok "Backed up $name: $LAST_BACKUP ($(du -h "$LAST_BACKUP" | cut -f1))"
+}
+
+cmd_backup() {
+  local target="${1:-}" live=0 fails=0 n
+  [[ -n "$target" ]] || fail "Usage: ops-app backup <name>|--all [--live]" "e.g. sudo ops-app backup kontor"
+  [[ "${2:-}" == --live ]] && live=1
+  need_root backup "$@"; need_docker
+  command -v jq >/dev/null || fail "jq is needed for backups" "sudo apt install jq"
+  if [[ "$target" == --all ]]; then
+    for n in $(app_dirs); do backup_one "$n" "$live" || fails=$((fails + 1)); done
+    backup_one _proxy 1 || fails=$((fails + 1))   # Caddy's certificate authority
+    (( fails == 0 )) || fail "$fails backup(s) failed (see above)" "Check free space (df -h $BACKUPS) and the app's state (ops-app list)"
+    info "These contain .env secrets and app keys: they're root-only. For an off-site copy, Proxmox backups of this VM include $BACKUPS."
+  else
+    backup_one "$target" "$live" || fail "Backup of $target failed (see above)" "Check free space: df -h $BACKUPS"
+  fi
+}
+
+cmd_backups() {
+  local n f
+  need_root backups
+  for n in ${1:-$(ls "$BACKUPS" 2>/dev/null)}; do
+    printf '%s%s%s\n' "$B" "$n" "$N"
+    ls -1t "$BACKUPS/$n"/*.tar.gz 2>/dev/null | while read -r f; do
+      printf '  %-62s %6s  %s\n' "$f" "$(du -h "$f" | cut -f1)" "$(tar -xzOf "$f" ./backup.txt 2>/dev/null | sed -n 's/^commit=//p' | cut -c1-7)"
+    done
+  done
+}
+
+cmd_restore() {
+  local name="${1:-}" file="${2:-}" yes=0 d tmp img v
+  [[ "${3:-}" == --yes || "${2:-}" == --yes ]] && yes=1
+  [[ -n "$name" && -n "$file" && "$file" != --yes ]] || fail "Usage: ops-app restore <name> <backup-file> --yes" "List backups: sudo ops-app backups $name"
+  need_root restore "$name" "$file"; need_docker
+  [[ -f "$file" ]] || file="$BACKUPS/$name/$file"
+  [[ -f "$file" ]] || fail "No backup file $file" "List them: sudo ops-app backups $name"
+  d="$APPS_DIR/$name"
+  info "Backup: $(tar -xzOf "$file" ./backup.txt | tr '\n' ' ')"
+  (( yes )) || fail "Restoring replaces $name's current data with this backup" "Run again with --yes (a backup of the current state is made first, so it can be undone)"
+
+  step "Back up the current state first"
+  backup_one "$name" 0 || fail "Couldn't back up the current state, so nothing was restored" "Check free space: df -h $BACKUPS"
+  local undo="$LAST_BACKUP"
+
+  step "Put the data back"
+  tmp="$(mktemp -d -p "$BACKUPS" .tmp.XXXX)"; tar -C "$tmp" -xzf "$file"
+  compose "$d" stop >/dev/null 2>&1 || true
+  img="$(helper_image)"
+  for f in "$tmp"/vol-*.tar; do
+    [[ -e "$f" ]] || continue
+    v="$(basename "$f" .tar)"; v="${v#vol-}"
+    docker volume create "$v" >/dev/null
+    docker run --rm -v "$v:/v" -v "$tmp:/in:ro" --entrypoint sh "$img" -c "find /v -mindepth 1 -delete && tar -C /v -xf /in/vol-$v.tar" ||
+      { rm -rf "$tmp"; fail "Couldn't restore volume $v" "Undo with the backup made a moment ago: sudo ops-app restore $name $undo --yes"; }
+    ok "Volume $v restored"
+  done
+  [[ -f "$tmp/files.tar" ]] && tar -C "$d" -xf "$tmp/files.tar" && ok ".env and the app's own files restored"
+  local commit; commit="$(sed -n 's/^commit=//p' "$tmp/backup.txt")"
+  rm -rf "$tmp"
+  if [[ -n "$commit" && -d "$d/.git" && "$(git -C "$d" rev-parse HEAD)" != "$commit" ]]; then
+    meta_set "$name" PREV_COMMIT "$(git -C "$d" rev-parse HEAD)"
+    app_git "$name" checkout --quiet --detach "$commit" && info "Code set back to the version of the backup ($(git -C "$d" log -1 --format='%h %s'))"
+  fi
+
+  step "Start it"
+  compose "$d" up -d --build --remove-orphans || fail "It didn't start (see above)" "Undo: sudo ops-app restore $name $undo --yes"
+  local port; port="$(meta_get "$name" PORT)"
+  [[ -n "$port" ]] && { check_app "$name" "$port" || hint "Look at: ops-app logs $name. Undo: sudo ops-app restore $name $undo --yes"; }
+  ok "$name restored from $(basename "$file") (undo: sudo ops-app restore $name $undo --yes)"
+}
+
 cmd_reload() {
   caddy_running || die "Caddy isn't running: cd $PROXY && docker compose up -d"
   docker exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null ||
@@ -426,6 +933,13 @@ case "$cmd" in
   ca)      cmd_ca "$@" ;;
   doctor)  cmd_doctor ;;
   reload)  cmd_reload ;;
+  deploy)  cmd_deploy "$@" ;;
+  update)  cmd_update "$@" ;;
+  rollback) cmd_rollback "$@" ;;
+  env)     cmd_env "$@" ;;
+  backup)  cmd_backup "$@" ;;
+  backups) cmd_backups "$@" ;;
+  restore) cmd_restore "$@" ;;
   help|-h|--help) usage ;;
   *) usage >&2; exit 1 ;;
 esac

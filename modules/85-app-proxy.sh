@@ -10,6 +10,7 @@ require_root; require_supported_os; load_config
 command -v docker >/dev/null && docker info >/dev/null 2>&1 ||
   die "Docker isn't running. Enable the docker module too (ENABLE_DOCKER=yes)."
 
+ensure_packages git jq curl openssl
 SRC="$OPS_ROOT/apps"
 PROXY="$APPS_DIR/_proxy"
 TEMPLATES=/usr/local/share/ops-app/templates
@@ -48,6 +49,8 @@ fi
 # --- Folders: $APPS_DIR/<app>/ and $APPS_DIR/_proxy/ --------------------------
 # Group docker can manage apps without sudo (docker group = root-equivalent anyway).
 install -d -m 2775 -o root -g docker "$APPS_DIR" "$PROXY" "$PROXY/conf" "$PROXY/conf/sites" "$PROXY/public"
+# Deploy keys and per-app facts: root only.
+install -d -m 700 -o root -g root "$APPS_DIR/.keys" "$APPS_DIR/.meta" "$APPS_BACKUP_DIR"
 changed=0
 write_if_changed "$PROXY/compose.yml" 0644 < "$SRC/proxy/compose.yml" && changed=1 || true
 
@@ -121,6 +124,8 @@ APPS_DIR=$APPS_DIR
 APPS_DOMAIN=$APPS_DOMAIN
 PROXY_SUBNET=$PROXY_SUBNET
 TEMPLATES_DIR=$TEMPLATES
+APPS_BACKUP_DIR=$APPS_BACKUP_DIR
+APPS_BACKUP_KEEP=$APPS_BACKUP_KEEP
 EOF
 ok "Installed ops-app (try: ops-app help)"
 
@@ -159,6 +164,43 @@ else
   rm -f "$PROXY/public/root.crt" "$PROXY/public/index.html"
 fi
 
+# --- Nightly backups ---------------------------------------------------------------
+if is_true "$APPS_BACKUP"; then
+  [[ "$APPS_BACKUP_TIME" =~ ^[0-2][0-9]:[0-5][0-9]$ ]] || die_fix "APPS_BACKUP_TIME '$APPS_BACKUP_TIME' isn't a time" "Use HH:MM, e.g. 03:30"
+  write_if_changed /etc/systemd/system/ops-app-backup.service 0644 <<EOF || true
+# Managed by ops-scripts (modules/85-app-proxy.sh)
+[Unit]
+Description=Back up every app (ops-app backup --all)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ops-app backup --all
+EOF
+  write_if_changed /etc/systemd/system/ops-app-backup.timer 0644 <<EOF || true
+# Managed by ops-scripts (modules/85-app-proxy.sh)
+[Unit]
+Description=Nightly app backups
+
+[Timer]
+OnCalendar=*-*-* $APPS_BACKUP_TIME:00
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now ops-app-backup.timer >/dev/null 2>&1
+  ok "Nightly backups at $APPS_BACKUP_TIME into $APPS_BACKUP_DIR, keeping $APPS_BACKUP_KEEP per app (see: ops-app backups)"
+  info "Last run: journalctl -u ops-app-backup --since yesterday"
+else
+  systemctl disable --now ops-app-backup.timer >/dev/null 2>&1 || true
+  warn "Nightly app backups are off (APPS_BACKUP=no)"
+fi
+
 ip="$(hostname -I | awk '{print $1}')"
 info "DNS: in AdGuard add the rewrite  *.$APPS_DOMAIN -> $ip  (or ADGUARD_REWRITES on the DNS box)"
-info "Next: ops-app new <name> --image IMAGE --port N, or ops-app adopt kontor --port 8080"
+info "Next: your own app from Git:  sudo ops-app deploy <name> <git-url>   (e.g. Kontor)"
+info "      or a ready-made one:      ops-app new nextcloud --template nextcloud"

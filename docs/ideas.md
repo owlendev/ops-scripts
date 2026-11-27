@@ -24,16 +24,16 @@ New machine) or settings. Today's workaround: `rm bin/ops-linux-*` then `./ops`.
 Fix: write the version next to the binary, and rebuild or redownload when it differs
 from the checkout (`git describe`, or a hash of `tui/`).
 
-### 3. Backups aren't set up by anything
-Nothing creates a backup job, and the most valuable data lives in the machines:
-`/srv/apps` and the Docker volumes (Kontor's data and `master.key`, Nextcloud's
-files and Postgres), and Caddy's CA in `proxy_caddy-data`. If that volume is lost,
-every device has to trust a new certificate.
-- On the Proxmox host: create a nightly vzdump job for machines tagged `ops`
-  (`pvesh create /cluster/backup ...`) from the UI, with retention.
-- In the apps VM: dump databases before the backup runs (a `pg_dump` for Nextcloud),
-  so a restore never depends on a crash-consistent copy of a running database.
-- Document and test a restore.
+### 3. Backups: the Proxmox side
+App-level backups now exist (`ops-app backup`, nightly, including Caddy's CA). What's
+still missing:
+- On the Proxmox host: a nightly vzdump job for machines tagged `ops`
+  (`pvesh create /cluster/backup ...`), with retention. That's the off-site/whole-machine layer.
+- An off-site copy of `/srv/backups` (rclone to S3/R2/B2), encrypted (e.g. `age`).
+  Backups contain `.env` secrets and keys like Kontor's `master.key` in the clear.
+- `ops-app backup` stops each app for a few seconds. Apps with a database container could
+  instead dump it (`pg_dump`/`mysqldump`) live. A per-app hook would allow that.
+- A tested restore on a fresh VM, written down.
 
 ### 4. Firewall for LXCs, done by Proxmox
 UFW may not run inside an unprivileged container. The module then only warns.
@@ -84,9 +84,12 @@ or the router as the secondary (but that skips ad blocking and local names).
   been run. Also: this Caddy version has no `prefer_wildcard`, so each app gets its
   own certificate, and with real certificates every app name shows up in public
   Certificate Transparency logs. Fix: one `*.domain` site block that routes by host.
-- **Private apps can't be cloned**: `ops-app adopt` expects the app to be in
-  `/srv/apps/<name>` already. Add `ops-app clone <name> <git-url> --port N`, with a
-  deploy key for private repos like Kontor.
+- **Deploys need the TUI or a shell**: there's no webhook, so a `git push` doesn't
+  deploy. An `ops-app update` timer, or a webhook receiver behind Caddy, could do that.
+  Keep it off by default: an update can change data, so it should be deliberate.
+- **`ops-app deploy` guesses from names**: which `.env` names get the app's address
+  and which get random secrets is decided by their names (see `env_kind`). Unusual names
+  aren't filled. `ops-app env` lists them, and you fill them in by hand.
 - **Shared proxy network**: every proxied app can reach every other proxied app on it.
   Fine for your own apps. For an app you trust less, give it its own network with Caddy.
 - **Kontor's trusted proxy**: with `KONTOR_TRUST_PROXY=1`, another app on the proxy
