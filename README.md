@@ -964,6 +964,8 @@ Helpers in `lib/common.sh`: `info` `ok` `warn` `die` `die_fix` `hint` `in_contai
 
 ## Roadmap
 
+**Known fixes and next steps for the home lab parts: [docs/ideas.md](docs/ideas.md).**
+
 Ideas for when this outgrows bash:
 
 - **Terraform** for launching and destroying (instance, security group, EIP, DNS records, IAM role). Keep this repo for server preparation: Terraform can run `push-and-run.sh` from a `local-exec`, or clone the repo in `user_data`.
