@@ -247,8 +247,10 @@ if [[ "$MODE" == create ]]; then
     tstore="$(pvejson "/nodes/$NODE/storage" --content vztmpl --enabled 1 | jq -r '.[0].storage // empty')"
     [[ -n "$tstore" ]] || fail "No storage can hold container templates" "Datacenter → Storage → local → Edit → Content: add 'Container template'"
     pveam update >/dev/null 2>&1 || warn "Couldn't refresh the template list (no internet?); using what's known"
-    mapfile -t tpls < <(pveam available --section system 2>/dev/null | awk '{print $2}' | grep -E '^debian-[0-9]+-standard_' | sort -V -r)
-    [[ ${#tpls[@]} -gt 0 ]] || fail "No Debian templates found" "Check this host reaches the internet (ping -c1 download.proxmox.com), then retry"
+    # The list holds templates for several CPU types (amd64, arm64): keep only this host's.
+    arch="$(dpkg --print-architecture)"
+    mapfile -t tpls < <(pveam available --section system 2>/dev/null | awk '{print $2}' | grep -E "^debian-[0-9]+-standard_.*_${arch}\.tar\." | sort -V -r)
+    [[ ${#tpls[@]} -gt 0 ]] || fail "No Debian templates found for this CPU ($arch)" "Check this host reaches the internet (ping -c1 download.proxmox.com), then retry"
   else
     step "Get the Debian cloud image"
     why "A VM starts from Debian's official cloud image, set up on first boot by cloud-init."
