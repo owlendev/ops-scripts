@@ -768,6 +768,19 @@ cmd_update() {
     fail "Couldn't move to the new code (the branch history was rewritten?)" "Look: git -C $d log --oneline -3 origin/$branch. To take the remote as is: git -C $d reset --hard origin/$branch, then update again"
   ok "Now at $(app_git "$name" log -1 --format='%h %s')"
 
+  # .env is yours and is never overwritten; just say when the new code expects settings it lacks.
+  local ex="" k missing=""
+  for f in .env.example .env.sample env.example .env.dist; do [[ -f "$d/$f" ]] && { ex="$d/$f"; break; }; done
+  if [[ -n "$ex" && -f "$d/.env" ]]; then
+    for k in $(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$ex" | tr -d '='); do
+      grep -qE "^$k=" "$d/.env" || missing+=" $k"
+    done
+    if [[ -n "$missing" ]]; then
+      warn "The new version has settings your .env doesn't:$missing"
+      hint "See them with their comments in $ex; add the ones you need: sudo nano $d/.env, then ops-app up $name"
+    fi
+  fi
+
   step "Rebuild and restart"
   compose "$d" up -d --build --remove-orphans ||
     fail "The new version didn't build or start (the error is above)" "If the build failed, the old containers may still be running. Go back to the previous code: sudo ops-app rollback $name"
