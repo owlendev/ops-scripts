@@ -107,6 +107,8 @@ cmd_info() {
            { grep -vE " root@$NODE\$| root@[a-z0-9-]+\$" || true; } | jq -R . | jq -sc .)"
   machines="[]"
   for f in $(machine_files); do
+    # Deleted from Proxmox (e.g. pct destroy): its name and IP are free again.
+    [[ -n "$(guest_status "$(mget "$f" PVE_ID)" "$(mget "$f" PVE_KIND)")" ]] || continue
     machines="$(jq -c --arg id "$(mget "$f" PVE_ID)" --arg name "$(mget "$f" PVE_NAME)" --arg kind "$(mget "$f" PVE_KIND)" \
       --arg ip "$(mget "$f" PVE_IP)" --arg recipe "$(mget "$f" PVE_RECIPE)" --arg user "$(mget "$f" ADMIN_USER)" \
       --arg domain "$(mget "$f" APPS_DOMAIN)" --arg done "$(mget "$f" PVE_DONE)" \
