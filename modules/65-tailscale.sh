@@ -60,7 +60,7 @@ elif [[ -n "$TAILSCALE_AUTHKEY" ]]; then
   ok "Connected to your tailnet"
 else
   warn "Not logged in to Tailscale yet. Run this and open the URL it prints:"
-  warn "  sudo tailscale up$($ssh_flag && echo ' --ssh')${TAILSCALE_HOSTNAME:+ --hostname=$TAILSCALE_HOSTNAME}"
+  warn "  sudo tailscale up$($ssh_flag && echo ' --ssh')${TAILSCALE_HOSTNAME:+ --hostname=$TAILSCALE_HOSTNAME}${routes:+ --advertise-routes=$routes}"
   exit 0
 fi
 

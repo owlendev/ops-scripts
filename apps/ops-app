@@ -769,7 +769,7 @@ cmd_update() {
   ok "Now at $(app_git "$name" log -1 --format='%h %s')"
 
   # .env is yours and is never overwritten; just say when the new code expects settings it lacks.
-  local ex="" k missing=""
+  local ex="" k f missing=""
   for f in .env.example .env.sample env.example .env.dist; do [[ -f "$d/$f" ]] && { ex="$d/$f"; break; }; done
   if [[ -n "$ex" && -f "$d/.env" ]]; then
     for k in $(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$ex" | tr -d '='); do
