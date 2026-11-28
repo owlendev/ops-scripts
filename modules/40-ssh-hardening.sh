@@ -69,12 +69,20 @@ if [[ " $old_ports " != *" $SSH_PORT "* ]] && ufw status 2>/dev/null | grep -q '
   info "Opened new SSH port $SSH_PORT in UFW"
 fi
 
-# Ubuntu 22.10+ uses socket activation: the port comes from ssh.socket.
-if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+# Ubuntu 22.10+ uses socket activation: the port comes from ssh.socket, so it only
+# needs a restart when the port changes. Debian 13 images can have ssh.socket AND a
+# running ssh.service; the socket then refuses to restart while the service runs, so
+# stop the service first (existing sessions stay: ssh.service uses KillMode=process).
+if [[ " $old_ports " != *" $SSH_PORT "* ]] && systemctl is-active --quiet ssh.socket 2>/dev/null; then
   systemctl daemon-reload
+  systemctl stop ssh.service 2>/dev/null || true
   systemctl restart ssh.socket
 fi
-systemctl restart ssh 2>/dev/null || systemctl restart sshd
+if ! { systemctl restart ssh 2>/dev/null || systemctl restart sshd; }; then
+  # Remove the drop-in so a re-run applies it again instead of saying "already applied".
+  rm -f "$DROPIN"
+  die "Restarting sshd failed; removed $DROPIN. See: journalctl -u ssh -n 30"
+fi
 ok "sshd hardened and restarted (existing sessions stay connected)"
 
 if [[ " $old_ports " != *" $SSH_PORT "* ]]; then
